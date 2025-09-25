@@ -35,8 +35,8 @@ Los hostnames se almacenan en sqlite. Por defecto el nombre es 'doh_blocklist.db
 
 Ideas para después:
 
-[] Poder tener estadísticas de cuál proveedor de DNS es más rápido
-[] Poder tener estadísticas de bloqueos por hostname
-[] Servicio de autostart para iniciado automático
+- [ ] Poder tener estadísticas de cuál proveedor de DNS es más rápido
+- [ ] Poder tener estadísticas de bloqueos por hostname
+- [ ] Servicio de autostart para iniciado automático
 
 **Importante: Esto no evita DNS leaks**
