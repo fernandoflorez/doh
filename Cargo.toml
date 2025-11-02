@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4.42"
 clap = { version = "4.5.48", features = ["derive"] }
 futures = "0.3.31"
 hickory-proto = "0.25.2"
