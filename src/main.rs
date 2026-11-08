@@ -50,7 +50,7 @@ struct Args {
     listen: SocketAddr,
 
     /// DoH servers to race, comma separated: google, cloudflare, quad9,
-    /// opendns or NAME=URL. Defaults to all the built-in ones.
+    /// opendns or NAME=URL (https only). Defaults to all the built-in ones.
     #[arg(
         short,
         long,
@@ -99,6 +99,7 @@ const DOH_SERVERS: Servers = &[
     ("Quad9", "https://9.9.9.9/dns-query"),
     ("OpenDNS", "https://208.67.222.222/dns-query"),
 ];
+const MAX_DNS_MESSAGE: usize = 65_535;
 const STATS_QUEUE: usize = 4096;
 const PURGE_EVERY: Duration = Duration::from_secs(3600);
 
@@ -130,8 +131,9 @@ struct Resolver {
 
 fn parse_server(value: &str) -> Result<(&'static str, &'static str), String> {
     if let Some((name, url)) = value.split_once('=') {
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return Err(format!("invalid URL for {name}: {url}"));
+        let plaintext_allowed = cfg!(test) && url.starts_with("http://");
+        if !url.starts_with("https://") && !plaintext_allowed {
+            return Err(format!("invalid URL for {name}: {url} (https only)"));
         }
         // ponytail: leaked once at startup so every task can share it as 'static
         return Ok((Box::leak(name.into()), Box::leak(url.into())));
@@ -202,16 +204,25 @@ async fn doh_req(
     msg.add_query(Query::query(Name::from_ascii(domain)?, record_type));
     msg.metadata.recursion_desired = true;
 
-    let response = client
+    let mut response = client
         .post(url)
         .header("Content-Type", "application/dns-message")
         .body(msg.to_vec()?)
         .send()
-        .await?
-        .bytes()
         .await?;
+    if !response.status().is_success() {
+        return Err(format!("upstream returned {}", response.status()).into());
+    }
 
-    Ok((Message::from_bytes(&response)?, name))
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_DNS_MESSAGE {
+            return Err("upstream response too large".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok((Message::from_bytes(&body)?, name))
 }
 
 async fn doh_race(
@@ -415,6 +426,9 @@ impl Resolver {
         Ok(Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(args.upstream_timeout))
+                .https_only(!cfg!(test))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()?,
             servers: select_servers(&args.servers),
             blocklist,
@@ -1430,6 +1444,66 @@ mod tests {
             &[b"caf\xc3\xa9", b"com"],
         ] {
             assert_eq!(query_domain(&name(bad)), None, "{bad:?}");
+        }
+    }
+
+    /// Servidor HTTP mínimo que responde siempre los mismos bytes crudos.
+    async fn mock_raw(response: Vec<u8>) -> &'static str {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url =
+            format!("http://{}/dns-query", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        Box::leak(url.into_boxed_str())
+    }
+
+    fn http_response(status: &str, extra: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[tokio::test]
+    async fn race_rejects_bad_status_redirects_and_oversized_bodies() {
+        let mut valid = Message::response(1, OpCode::Query);
+        valid.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let valid = valid.to_vec().unwrap();
+        let cases = [
+            http_response("500 Internal Server Error", "", &valid),
+            http_response(
+                "302 Found",
+                "location: http://127.0.0.1:1/\r\n",
+                &valid,
+            ),
+            http_response("200 OK", "", &vec![0u8; MAX_DNS_MESSAGE + 1]),
+        ];
+        for response in cases {
+            let servers =
+                leak_servers(vec![("Bad", mock_raw(response).await)]);
+            let res = doh_race(
+                &Client::new(),
+                servers,
+                "example.com",
+                RecordType::A,
+            )
+            .await;
+            assert!(res.is_err());
         }
     }
 }
