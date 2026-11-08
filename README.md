@@ -58,8 +58,20 @@ Por defecto se conservan 60 días; las entradas más viejas se borran automátic
 ```cargo run -- --stats-retention 30```
 
 
-Ideas para después:
+Inicio automático:
 
-- [ ] Servicio de autostart para iniciado automático
+En `contrib/` hay archivos de servicio para Linux (systemd) y macOS (launchd). Ambos esperan el binario en `/usr/local/bin/doh`:
+
+```cargo build --release && sudo cp target/release/doh /usr/local/bin/```
+
+Linux (no requiere root gracias a `CAP_NET_BIND_SERVICE`; la base queda en `/var/lib/doh`):
+
+```sudo cp contrib/doh.service /etc/systemd/system/ && sudo systemctl enable --now doh```
+
+macOS (la base queda en `/usr/local/var/doh` y los errores en `/usr/local/var/log/doh.log`):
+
+```sudo mkdir -p /usr/local/var/doh /usr/local/var/log && sudo cp contrib/local.doh.plist /Library/LaunchDaemons/ && sudo launchctl bootstrap system /Library/LaunchDaemons/local.doh.plist```
+
+Para cargar una blocklist en la base del servicio, se usa `--db-path` con la misma ruta y se reinicia el servicio.
 
 **Importante: Esto no evita DNS leaks**

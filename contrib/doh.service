@@ -1,0 +1,17 @@
+[Unit]
+Description=DNS over HTTPS proxy with ad-blocking
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/doh --db-path /var/lib/doh/doh_blocklist.db
+DynamicUser=yes
+StateDirectory=doh
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
