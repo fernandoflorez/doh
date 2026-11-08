@@ -4,12 +4,19 @@
 # db_path = "doh_blocklist.db"
 # listen = "127.0.0.1:53"
 
-# Built-in: google, cloudflare, quad9, opendns. Custom: "NAME=URL".
+# user = "nobody"        # switch to this user after binding (start as root)
+
+# Built-in: google, cloudflare, quad9, opendns. Custom: "NAME=URL" (https only).
 # servers = ["cloudflare", "quad9", "mine=https://doh.example.com/dns-query"]
 
-# upstream_timeout = 5   # seconds
-# cache_size = 10000     # entries
-# blocked_ttl = 60       # seconds
-# tcp_timeout = 10       # seconds
-# stats_retention = 60   # days
+# upstream_timeout = 5          # seconds
+# max_upstream_queries = 256    # cache misses in flight
+# cache_size = 10000            # entries
+# cache_max_mb = 32             # megabytes
+# max_ttl = 86400               # seconds
+# blocked_ttl = 60              # seconds
+# tcp_timeout = 10              # seconds
+# max_tcp_connections = 256     # simultaneous TCP clients
+# stats_retention = 60          # days
+# stats_max_rows = 1000000      # rows per statistics table
 # verbose = false

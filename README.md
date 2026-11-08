@@ -13,9 +13,10 @@ It listens for regular DNS queries (UDP and TCP) and races every configured DoH 
 Features:
 
 - In-memory response cache that honors TTLs.
-- Blocklists stored in SQLite and loaded into memory at startup; subdomains of blocked domains are blocked too.
+- Blocklists stored in SQLite and loaded into memory at startup; subdomains of blocked domains are blocked too, and so are answers whose CNAME points to a blocked domain.
 - Statistics about the fastest provider and the most blocked domains, with automatic cleanup.
 - Single-threaded async runtime with a small memory footprint.
+- Bounded by design: caps on TCP connections, upstream lookups in flight, cache memory and statistics rows.
 
 
 ## Usage
@@ -33,6 +34,8 @@ cargo run -- --listen 127.0.0.1:5300
 dig @127.0.0.1 -p 5300 example.com
 ```
 
+**Exposure:** doh has no client access list and answers anyone who can reach it. Listening on `0.0.0.0` or a LAN address is meant for a trusted local network; never expose it to the Internet (check your firewall and router port forwards), or it becomes an open resolver that can be abused for DNS amplification attacks.
+
 Responses that do not fit in UDP are sent truncated so the client retries over TCP.
 
 Per-query logging (queries, cache hits, blocked domains and the winning provider) is off by default:
@@ -41,11 +44,21 @@ Per-query logging (queries, cache hits, blocked domains and the winning provider
 cargo run -- --verbose
 ```
 
-To pick which DoH servers take part in the race, use `--servers` with built-in names or your own servers as `NAME=URL`:
+To pick which DoH servers take part in the race, use `--servers` with built-in names or your own servers as `NAME=URL` (HTTPS only):
 
 ```sh
 cargo run -- --servers cloudflare,quad9,mine=https://doh.example.com/dns-query
 ```
+
+Resource limits, all configurable:
+
+| Flag | Default | Limits |
+|---|---|---|
+| `--max-tcp-connections` | 256 | Simultaneous TCP clients |
+| `--max-upstream-queries` | 256 | Cache misses waiting on DoH servers |
+| `--cache-size` / `--cache-max-mb` | 10,000 / 32 MB | Cached answers, by count and by memory |
+| `--max-ttl` | 86,400 s | How long an answer stays cached |
+| `--stats-max-rows` | 1,000,000 | Rows kept per statistics table |
 
 Run `cargo run -- --help` to see every option.
 
@@ -74,7 +87,7 @@ Domains are stored in SQLite, in `doh_blocklist.db` by default (change it with `
 Every option can be set in a TOML file, using the flag name as the key (`cache_size` or `cache-size`). Command line flags take precedence over the file. See `contrib/doh.toml` for a commented example.
 
 ```toml
-listen = "0.0.0.0:53"
+listen = "192.168.1.10:53"
 servers = ["cloudflare", "quad9"]
 cache_size = 20000
 stats_retention = 30
