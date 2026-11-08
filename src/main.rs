@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 
 #[derive(Parser, Debug)]
@@ -72,9 +73,14 @@ struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     blocked_ttl: u32,
 
-    /// Seconds an idle TCP client connection is kept open.
+    /// Seconds an idle TCP client connection is kept open, and the limit
+    /// for writing each response to it.
     #[arg(long, value_name = "SECONDS", default_value_t = 10)]
     tcp_timeout: u64,
+
+    /// Maximum number of simultaneous TCP client connections.
+    #[arg(long, value_name = "CONNECTIONS", default_value_t = 256)]
+    max_tcp_connections: usize,
 
     /// Print the stored statistics and exit.
     #[arg(long)]
@@ -127,6 +133,7 @@ struct Resolver {
     cache_size: usize,
     blocked_ttl: u32,
     tcp_timeout: Duration,
+    max_tcp_connections: usize,
 }
 
 fn parse_server(value: &str) -> Result<(&'static str, &'static str), String> {
@@ -447,6 +454,7 @@ impl Resolver {
             cache_size: args.cache_size,
             blocked_ttl: args.blocked_ttl,
             tcp_timeout: Duration::from_secs(args.tcp_timeout),
+            max_tcp_connections: args.max_tcp_connections,
         })
     }
 
@@ -626,13 +634,18 @@ async fn handle_tcp(
             return Ok(());
         };
         let bytes = response.to_vec()?;
-        stream.write_u16(u16::try_from(bytes.len())?).await?;
-        stream.write_all(&bytes).await?;
+        let len = u16::try_from(bytes.len())?;
+        timeout(resolver.tcp_timeout, async {
+            stream.write_u16(len).await?;
+            stream.write_all(&bytes).await
+        })
+        .await??;
     }
     Ok(())
 }
 
 async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
+    let slots = Arc::new(Semaphore::new(resolver.max_tcp_connections));
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -642,8 +655,13 @@ async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
                 continue;
             }
         };
+        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
+            vlog!("TCP connection limit reached, closing new connection");
+            continue;
+        };
         let resolver = Arc::clone(&resolver);
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle_tcp(stream, &resolver).await {
                 vlog!("Error handling TCP connection: {}", e);
             }
@@ -748,6 +766,7 @@ mod tests {
             cache_size: 10_000,
             blocked_ttl: 60,
             tcp_timeout: 10,
+            max_tcp_connections: 256,
             stats: false,
             stats_retention: 60,
             verbose: false,
@@ -854,12 +873,15 @@ mod tests {
     }
 
     async fn start(conn: Connection, servers: Servers) -> SocketAddr {
+        start_resolver(resolver(conn, servers)).await
+    }
+
+    async fn start_resolver(resolver: Resolver) -> SocketAddr {
         VERBOSE.store(true, Ordering::Relaxed);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
-        let resolver = Arc::new(resolver(conn, servers));
-        tokio::spawn(serve(socket, listener, resolver));
+        tokio::spawn(serve(socket, listener, Arc::new(resolver)));
         addr
     }
 
@@ -1556,5 +1578,28 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_connections_beyond_the_limit_are_closed() {
+        let mut limited =
+            resolver(blocked_db(Path::new(":memory:")), DOH_SERVERS);
+        limited.max_tcp_connections = 1;
+        let addr = start_resolver(limited).await;
+
+        let held = ask_tcp(addr, "ads.example.com.", RecordType::A).await;
+        assert_eq!(held.answers.len(), 1);
+        let first = TcpStream::connect(addr).await.unwrap();
+        let mut rejected = TcpStream::connect(addr).await.unwrap();
+        // La segunda conexión simultánea se cierra sin respuesta.
+        let query = query_bytes("ads.example.com.", RecordType::A);
+        let _ = rejected.write_u16(query.len() as u16).await;
+        let _ = rejected.write_all(&query).await;
+        assert!(rejected.read_u16().await.is_err());
+
+        drop(first);
+        sleep(Duration::from_millis(50)).await;
+        let freed = ask_tcp(addr, "ads.example.com.", RecordType::A).await;
+        assert_eq!(freed.answers.len(), 1);
     }
 }
