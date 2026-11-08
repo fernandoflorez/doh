@@ -38,7 +38,7 @@ struct Args {
     #[arg(short, long, default_value = "doh_blocklist.db")]
     db_path: PathBuf,
 
-    /// Import a blocklist from a local file.
+    /// Import a blocklist from a local file and exit.
     #[arg(short, long, value_name = "FILE")]
     blocklist: Option<PathBuf>,
 
@@ -792,6 +792,7 @@ fn prepare(args: &Args) -> Result<Option<Connection>, BoxError> {
             &mut conn,
             io::BufReader::new(File::open(path)?),
         )?;
+        return Ok(None);
     }
     Ok(Some(conn))
 }
@@ -1067,7 +1068,8 @@ mod tests {
 
         let mut args = args(db_path.clone());
         args.blocklist = Some(list_path);
-        let conn = prepare(&args).unwrap().unwrap();
+        assert!(prepare(&args).unwrap().is_none());
+        let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocklist"), 2);
         drop(conn);
 

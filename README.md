@@ -58,6 +58,8 @@ Download a blocklist in hosts or plain domain format, for example https://v.fire
 cargo run -- --blocklist AdguardDNS.txt
 ```
 
+The import exits when it finishes; start the server afterwards. A running server loads the blocklist at startup, so restart it to pick up a new import.
+
 To remove every blocked domain:
 
 ```sh
