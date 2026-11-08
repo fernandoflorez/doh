@@ -1,9 +1,9 @@
-Proxy DNS-over-HTTPS
-=====================
+doh
+===
 
-Pequeño proyecto en RUST para DoH.
+A small, fast DNS-over-HTTPS proxy with Pi-hole style ad blocking, written in Rust.
 
-Expone un servidor UDP en puerto 53 (DNS) y realiza un request de resolución de dominio a uno de los servidores públicos de DNS-over-HTTPS:
+It listens for regular DNS queries (UDP and TCP) and races every configured DoH provider, answering with the first successful response. By default it uses:
 
 - Google (8.8.8.8)
 - Cloudflare (1.1.1.1)
@@ -11,51 +11,66 @@ Expone un servidor UDP en puerto 53 (DNS) y realiza un request de resolución de
 - OpenDNS (208.67.222.222)
 - Mullvad (194.242.2.2)
 
+Features:
 
-Al recibir una solicitud de resolv realiza una carrera (race) entre todos los proveedores de DNS registrados y retorna el primer resultado obtenido.
-
-Se agrega soporte para blocklists (bloqueo de ads por ejemplo ala PI-Hole):
-
-- Descargar una blocklist, ej: https://v.firebog.net/hosts/AdguardDNS.txt
-- Se tiene un argument --blocklist donde se le pasa el .txt descargado:
-
-```cargo run --blocklist AdguardDNS.txt```
+- In-memory response cache that honors TTLs.
+- Blocklists stored in SQLite and loaded into memory at startup; subdomains of blocked domains are blocked too.
+- Statistics about the fastest provider and the most blocked domains, with automatic cleanup.
+- Single-threaded async runtime with a small memory footprint.
 
 
-Para eliminar los registros:
+## Usage
 
-```cargo run --clear```
+By default it listens on `127.0.0.1:53`, which is the port the system DNS settings use. Binding port 53 requires root (`sudo`). On Linux you can grant just that capability instead:
+
+```sh
+sudo setcap cap_net_bind_service=+ep target/release/doh
+```
+
+To listen on another address or port, use `--listen`:
+
+```sh
+cargo run -- --listen 127.0.0.1:5300
+dig @127.0.0.1 -p 5300 example.com
+```
+
+Responses that do not fit in UDP are sent truncated so the client retries over TCP.
+
+Per-query logging (queries, cache hits, blocked domains and the winning provider) is off by default:
+
+```sh
+cargo run -- --verbose
+```
+
+To pick which DoH servers take part in the race, use `--servers` with built-in names or your own servers as `NAME=URL`:
+
+```sh
+cargo run -- --servers cloudflare,quad9,mine=https://doh.example.com/dns-query
+```
+
+Run `cargo run -- --help` to see every option.
 
 
-Los hostnames se almacenan en sqlite. Por defecto el nombre es 'doh_blocklist.db' pero puede cambiarse con --db-path.
+## Blocklists
+
+Download a blocklist in hosts or plain domain format, for example https://v.firebog.net/hosts/AdguardDNS.txt, and import it:
+
+```sh
+cargo run -- --blocklist AdguardDNS.txt
+```
+
+To remove every blocked domain:
+
+```sh
+cargo run -- --clear
+```
+
+Domains are stored in SQLite, in `doh_blocklist.db` by default (change it with `--db-path`).
 
 
-Por defecto escucha en `127.0.0.1:53`, que es el puerto que usa la configuración DNS del sistema. Para usar el puerto 53 hace falta ejecutarlo con sudo (en Linux se puede evitar con `sudo setcap cap_net_bind_service=+ep target/release/doh`).
+## Configuration
 
-Para escuchar en otra dirección o puerto se usa --listen:
-
-```cargo run -- --listen 127.0.0.1:5300```
-
-```dig @127.0.0.1 -p 5300 example.com```
-
-Atiende consultas por UDP y TCP. Las respuestas que no entran en UDP se marcan como truncadas para que el cliente reintente por TCP.
-
-Por defecto no registra cada consulta. Para ver consultas, aciertos de caché, bloqueos y el servidor ganador:
-
-```cargo run -- --verbose```
-
-Las respuestas se guardan en caché en memoria respetando su TTL (por defecto hasta 10.000 entradas, configurable con --cache-size). La blocklist se carga en memoria al iniciar y bloquea también los subdominios de cada dominio de la lista.
-
-Para elegir los servidores de la carrera (por defecto se usan los cinco) se usa --servers, con nombres predefinidos o servidores propios como NOMBRE=URL:
-
-```cargo run -- --servers cloudflare,quad9,mio=https://doh.ejemplo.com/dns-query```
-
-Todas las opciones están en `cargo run -- --help`.
-
-
-Configuración:
-
-Todas las opciones se pueden poner en un archivo TOML usando el nombre del flag como clave (`cache_size` o `cache-size`). Los flags de la línea de comandos tienen prioridad sobre el archivo. Hay un ejemplo comentado en `contrib/doh.toml`:
+Every option can be set in a TOML file, using the flag name as the key (`cache_size` or `cache-size`). Command line flags take precedence over the file. See `contrib/doh.toml` for a commented example.
 
 ```toml
 listen = "0.0.0.0:53"
@@ -64,34 +79,57 @@ cache_size = 20000
 stats_retention = 30
 ```
 
-```cargo run -- --config doh.toml```
+```sh
+cargo run -- --config doh.toml
+```
 
 
-Estadísticas:
+## Statistics
 
-Se guarda qué proveedor ganó cada carrera y cada dominio bloqueado. Para verlas:
+The winning provider of each race and every blocked domain are recorded. To print a summary:
 
-```cargo run -- --stats```
+```sh
+cargo run -- --stats
+```
 
-Por defecto se conservan 60 días; las entradas más viejas se borran automáticamente. Para cambiarlo:
+Entries older than 60 days are deleted automatically. To change the retention period:
 
-```cargo run -- --stats-retention 30```
+```sh
+cargo run -- --stats-retention 30
+```
 
 
-Inicio automático:
+## Running as a service
 
-En `contrib/` hay archivos de servicio para Linux (systemd) y macOS (launchd). Ambos esperan el binario en `/usr/local/bin/doh`:
+`contrib/` contains service files for Linux (systemd) and macOS (launchd). Both expect the binary at `/usr/local/bin/doh`:
 
-```cargo build --release && sudo cp target/release/doh /usr/local/bin/```
+```sh
+cargo build --release && sudo cp target/release/doh /usr/local/bin/
+```
 
-Linux (no requiere root gracias a `CAP_NET_BIND_SERVICE`; la base queda en `/var/lib/doh`):
+Linux (runs without root thanks to `CAP_NET_BIND_SERVICE`; the database lives in `/var/lib/doh`):
 
-```sudo cp contrib/doh.service /etc/systemd/system/ && sudo systemctl enable --now doh```
+```sh
+sudo cp contrib/doh.service /etc/systemd/system/
+sudo systemctl enable --now doh
+```
 
-macOS (la base queda en `/usr/local/var/doh` y los errores en `/usr/local/var/log/doh.log`):
+macOS (the database lives in `/usr/local/var/doh` and errors go to `/usr/local/var/log/doh.log`):
 
-```sudo mkdir -p /usr/local/var/doh /usr/local/var/log && sudo cp contrib/local.doh.plist /Library/LaunchDaemons/ && sudo launchctl bootstrap system /Library/LaunchDaemons/local.doh.plist```
+```sh
+sudo mkdir -p /usr/local/var/doh /usr/local/var/log
+sudo cp contrib/local.doh.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/local.doh.plist
+```
 
-Para cargar una blocklist en la base del servicio, se usa `--db-path` con la misma ruta y se reinicia el servicio.
+The blocklist is loaded when the service starts, so restart it after importing a new list into its database with `--db-path`.
 
-**Importante: Esto no evita DNS leaks**
+
+## Notes
+
+This does not prevent DNS leaks.
+
+
+## License
+
+[MIT](LICENSE)
