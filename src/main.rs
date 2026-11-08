@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use futures::future::select_ok;
 use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -6,10 +6,12 @@ use hickory_proto::serialize::binary::BinDecodable;
 use reqwest::Client;
 use rusqlite::{Connection, Result, params};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,9 +24,15 @@ use tokio::time::{sleep, timeout};
 #[command(
     author,
     version,
-    about = "A DNS over HTTPS proxy with ad-blocking features."
+    about = "A DNS over HTTPS proxy with ad-blocking features.",
+    args_override_self = true
 )]
 struct Args {
+    /// TOML file with any of these options (keys use the long flag name).
+    /// Command line flags take precedence over the file.
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     /// Path to the SQLite database file for the blocklist and statistics.
     #[arg(short, long, default_value = "doh_blocklist.db")]
     db_path: PathBuf,
@@ -40,6 +48,33 @@ struct Args {
     /// Address and port to listen on for DNS queries (UDP and TCP).
     #[arg(short, long, default_value = "127.0.0.1:53")]
     listen: SocketAddr,
+
+    /// DoH servers to race, comma separated: google, cloudflare, quad9,
+    /// opendns, mullvad or NAME=URL. Defaults to the five built-in ones.
+    #[arg(
+        short,
+        long,
+        value_delimiter = ',',
+        value_parser = parse_server,
+        action = ArgAction::Set
+    )]
+    servers: Vec<(&'static str, &'static str)>,
+
+    /// Seconds to wait for a DoH server before giving up on it.
+    #[arg(long, value_name = "SECONDS", default_value_t = 5)]
+    upstream_timeout: u64,
+
+    /// Maximum number of cached responses.
+    #[arg(long, value_name = "ENTRIES", default_value_t = 10_000)]
+    cache_size: usize,
+
+    /// TTL in seconds for the answers to blocked domains.
+    #[arg(long, value_name = "SECONDS", default_value_t = 60)]
+    blocked_ttl: u32,
+
+    /// Seconds an idle TCP client connection is kept open.
+    #[arg(long, value_name = "SECONDS", default_value_t = 10)]
+    tcp_timeout: u64,
 
     /// Print the stored statistics and exit.
     #[arg(long)]
@@ -65,10 +100,7 @@ const DOH_SERVERS: Servers = &[
     ("OpenDNS", "https://208.67.222.222/dns-query"),
     ("Mullvad", "https://194.242.2.2/dns-query"),
 ];
-const CACHE_CAPACITY: usize = 10_000;
-const BLOCKED_TTL: u32 = 60;
 const STATS_QUEUE: usize = 4096;
-const TCP_IDLE: Duration = Duration::from_secs(10);
 const PURGE_EVERY: Duration = Duration::from_secs(3600);
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
@@ -92,6 +124,73 @@ struct Resolver {
     blocklist: HashSet<Box<str>>,
     cache: Mutex<HashMap<CacheKey, (Vec<u8>, Instant)>>,
     stats: SyncSender<Stat>,
+    cache_size: usize,
+    blocked_ttl: u32,
+    tcp_timeout: Duration,
+}
+
+fn parse_server(value: &str) -> Result<(&'static str, &'static str), String> {
+    if let Some((name, url)) = value.split_once('=') {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(format!("invalid URL for {name}: {url}"));
+        }
+        // ponytail: leaked once at startup so every task can share it as 'static
+        return Ok((Box::leak(name.into()), Box::leak(url.into())));
+    }
+    DOH_SERVERS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(value))
+        .copied()
+        .ok_or_else(|| format!("unknown server '{value}', expected a built-in name or NAME=URL"))
+}
+
+fn select_servers(servers: &[(&'static str, &'static str)]) -> Servers {
+    if servers.is_empty() {
+        return DOH_SERVERS;
+    }
+    Box::leak(servers.to_vec().into_boxed_slice())
+}
+
+fn config_args(path: &Path) -> Result<Vec<OsString>, BoxError> {
+    let table: toml::Table = std::fs::read_to_string(path)?.parse()?;
+    let mut args = Vec::new();
+    for (key, value) in table {
+        let flag = format!("--{}", key.replace('_', "-"));
+        let value = match value {
+            toml::Value::Boolean(true) => {
+                args.push(flag.into());
+                continue;
+            }
+            toml::Value::Boolean(false) => continue,
+            toml::Value::String(s) => s,
+            toml::Value::Integer(i) => i.to_string(),
+            toml::Value::Array(items) => items
+                .into_iter()
+                .map(|item| match item {
+                    toml::Value::String(s) => Ok(s),
+                    other => {
+                        Err(format!("{key}: expected strings, got {other}"))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(","),
+            other => {
+                return Err(format!("{key}: unsupported value {other}").into());
+            }
+        };
+        args.push(format!("{flag}={value}").into());
+    }
+    Ok(args)
+}
+
+fn with_config(args: Args, argv: &[OsString]) -> Result<Args, BoxError> {
+    let Some(path) = &args.config else {
+        return Ok(args);
+    };
+    let mut merged = argv[..1].to_vec();
+    merged.extend(config_args(path)?);
+    merged.extend_from_slice(&argv[1..]);
+    Ok(Args::try_parse_from(merged)?)
 }
 
 async fn doh_req(
@@ -278,7 +377,7 @@ fn print_stats(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn blocked_response(query: &Query) -> Message {
+fn blocked_response(query: &Query, ttl: u32) -> Message {
     let mut response = Message::response(0, OpCode::Query);
     response.metadata.recursion_desired = true;
     response.metadata.recursion_available = true;
@@ -290,7 +389,7 @@ fn blocked_response(query: &Query) -> Message {
     if let Some(rdata) = rdata {
         response.add_answer(Record::from_rdata(
             query.name().clone(),
-            BLOCKED_TTL,
+            ttl,
             rdata,
         ));
     }
@@ -298,19 +397,20 @@ fn blocked_response(query: &Query) -> Message {
 }
 
 impl Resolver {
-    fn new(
-        conn: Connection,
-        servers: Servers,
-        retention_days: u32,
-    ) -> Result<Self> {
+    fn new(conn: Connection, args: &Args) -> Result<Self, BoxError> {
         let blocklist = load_blocklist(&conn)?;
         println!("{} blocked domains in memory", blocklist.len());
         Ok(Self {
-            client: Client::new(),
-            servers,
+            client: Client::builder()
+                .timeout(Duration::from_secs(args.upstream_timeout))
+                .build()?,
+            servers: select_servers(&args.servers),
             blocklist,
             cache: Mutex::default(),
-            stats: spawn_stats_writer(conn, retention_days),
+            stats: spawn_stats_writer(conn, args.stats_retention),
+            cache_size: args.cache_size,
+            blocked_ttl: args.blocked_ttl,
+            tcp_timeout: Duration::from_secs(args.tcp_timeout),
         })
     }
 
@@ -379,11 +479,11 @@ impl Resolver {
         let now = Instant::now();
         let mut cache =
             self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= CACHE_CAPACITY {
+        if cache.len() >= self.cache_size {
             cache.retain(|_, (_, expires)| *expires > now);
             // ponytail: no LRU, a cache full of live entries is wiped; add LRU
             // if the hit rate suffers
-            if cache.len() >= CACHE_CAPACITY {
+            if cache.len() >= self.cache_size {
                 cache.clear();
             }
         }
@@ -403,7 +503,7 @@ impl Resolver {
         let mut response = if self.is_blocked(&domain) {
             vlog!("Blocked: {}", domain);
             self.record(Stat::Blocked(domain));
-            blocked_response(query)
+            blocked_response(query, self.blocked_ttl)
         } else {
             let key = (domain, qtype);
             if let Some(cached) = self.cached(&key) {
@@ -481,9 +581,11 @@ async fn handle_tcp(
     mut stream: TcpStream,
     resolver: &Resolver,
 ) -> Result<(), BoxError> {
-    while let Ok(Ok(len)) = timeout(TCP_IDLE, stream.read_u16()).await {
+    while let Ok(Ok(len)) =
+        timeout(resolver.tcp_timeout, stream.read_u16()).await
+    {
         let mut data = vec![0; len.into()];
-        timeout(TCP_IDLE, stream.read_exact(&mut data)).await??;
+        timeout(resolver.tcp_timeout, stream.read_exact(&mut data)).await??;
         let request = Message::from_bytes(&data)?;
         let Some(response) = resolver.resolve(&request).await else {
             return Ok(());
@@ -549,19 +651,30 @@ fn prepare(args: &Args) -> Result<Option<Connection>, BoxError> {
     Ok(Some(conn))
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), BoxError> {
-    let args = Args::parse();
+async fn run(argv: Vec<OsString>) -> Result<(), BoxError> {
+    let args = with_config(Args::parse_from(&argv), &argv)?;
     VERBOSE.store(args.verbose, Ordering::Relaxed);
     let Some(conn) = prepare(&args)? else {
         return Ok(());
     };
-    let resolver = Resolver::new(conn, DOH_SERVERS, args.stats_retention)?;
+    let resolver = Resolver::new(conn, &args)?;
     let socket = UdpSocket::bind(args.listen).await?;
     let listener = TcpListener::bind(args.listen).await?;
     println!("DNS server listening on {}", args.listen);
     serve(socket, listener, Arc::new(resolver)).await;
     Ok(())
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    if let Err(e) = run(std::env::args_os().collect()).await {
+        if let Some(e) = e.downcast_ref::<clap::Error>() {
+            e.exit();
+        }
+        eprintln!("Error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -595,10 +708,22 @@ mod tests {
             blocklist: None,
             clear: false,
             listen: "127.0.0.1:0".parse().unwrap(),
+            config: None,
+            servers: vec![],
+            upstream_timeout: 5,
+            cache_size: 10_000,
+            blocked_ttl: 60,
+            tcp_timeout: 10,
             stats: false,
             stats_retention: 60,
             verbose: false,
         }
+    }
+
+    fn resolver(conn: Connection, servers: Servers) -> Resolver {
+        let mut args = args(PathBuf::from(":memory:"));
+        args.servers = servers.to_vec();
+        Resolver::new(conn, &args).unwrap()
     }
 
     fn count(conn: &Connection, table: &str) -> i64 {
@@ -699,7 +824,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
-        let resolver = Arc::new(Resolver::new(conn, servers, 60).unwrap());
+        let resolver = Arc::new(resolver(conn, servers));
         tokio::spawn(serve(socket, listener, resolver));
         addr
     }
@@ -811,8 +936,7 @@ mod tests {
     #[test]
     fn blocks_listed_domains_and_their_subdomains_only() {
         let resolver =
-            Resolver::new(blocked_db(Path::new(":memory:")), DOH_SERVERS, 60)
-                .unwrap();
+            resolver(blocked_db(Path::new(":memory:")), DOH_SERVERS);
         assert!(resolver.is_blocked("ads.example.com"));
         assert!(resolver.is_blocked("x.y.ads.example.com"));
         assert!(!resolver.is_blocked("example.com"));
@@ -845,7 +969,7 @@ mod tests {
 
     #[test]
     fn cache_returns_entry_with_decreasing_ttl() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
+        let resolver = resolver(memory_db(), DOH_SERVERS);
         resolver.store(key("example.com"), &a_response(300));
         let cached = resolver.cached(&key("example.com")).unwrap();
         let ttl = cached.answers[0].ttl;
@@ -855,7 +979,7 @@ mod tests {
 
     #[test]
     fn cache_skips_errors_zero_ttl_and_empty_answers() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
+        let resolver = resolver(memory_db(), DOH_SERVERS);
 
         let mut servfail = a_response(300);
         servfail.metadata.response_code = ResponseCode::ServFail;
@@ -868,7 +992,7 @@ mod tests {
 
     #[test]
     fn cache_drops_expired_entries() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
+        let resolver = resolver(memory_db(), DOH_SERVERS);
         let bytes = a_response(300).to_vec().unwrap();
         resolver
             .cache
@@ -881,12 +1005,13 @@ mod tests {
 
     #[test]
     fn cache_evicts_when_full() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
+        let mut resolver = resolver(memory_db(), DOH_SERVERS);
+        resolver.cache_size = 100;
         let msg = a_response(300);
-        for i in 0..CACHE_CAPACITY {
+        for i in 0..100 {
             resolver.store(key(&format!("d{i}.com")), &msg);
         }
-        assert_eq!(resolver.cache.lock().unwrap().len(), CACHE_CAPACITY);
+        assert_eq!(resolver.cache.lock().unwrap().len(), 100);
         resolver.store(key("one-more.com"), &msg);
         assert_eq!(resolver.cache.lock().unwrap().len(), 1);
     }
@@ -930,7 +1055,7 @@ mod tests {
         assert_eq!(a.id, 4242);
         assert_eq!(a.message_type, MessageType::Response);
         assert_eq!(a.answers[0].data, RData::A(Ipv4Addr::UNSPECIFIED.into()));
-        assert_eq!(a.answers[0].ttl, BLOCKED_TTL);
+        assert_eq!(a.answers[0].ttl, 60);
 
         let aaaa = ask(addr, "Sub.ADS.example.com.", RecordType::AAAA)
             .await
@@ -1077,5 +1202,116 @@ mod tests {
         let mut args = args(db_path);
         args.stats = true;
         assert!(prepare(&args).unwrap().is_none());
+    }
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        std::iter::once("doh")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect()
+    }
+
+    fn write_config(name: &str, content: &str) -> PathBuf {
+        let path = temp_path(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn servers_accept_builtin_names_and_custom_urls() {
+        let args = Args::parse_from(argv(&[
+            "--servers",
+            "cloudflare,MULLVAD,mine=https://doh.example.com/dns-query",
+        ]));
+        assert_eq!(
+            select_servers(&args.servers),
+            [
+                ("Cloudflare", "https://1.1.1.1/dns-query"),
+                ("Mullvad", "https://194.242.2.2/dns-query"),
+                ("mine", "https://doh.example.com/dns-query"),
+            ]
+        );
+        assert_eq!(select_servers(&[]), DOH_SERVERS);
+        assert!(Args::try_parse_from(argv(&["-s", "nope"])).is_err());
+        assert!(Args::try_parse_from(argv(&["-s", "x=ftp://a"])).is_err());
+    }
+
+    #[test]
+    fn config_file_sets_options_and_cli_overrides_it() {
+        let path = write_config(
+            "config.toml",
+            r#"
+            listen = "0.0.0.0:5300"
+            cache_size = 500
+            verbose = true
+            clear = false
+            servers = ["quad9", "mine=https://doh.example.com/dns-query"]
+            "#,
+        );
+        let cli = argv(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:5301",
+            "--servers",
+            "google",
+        ]);
+        let args = with_config(Args::parse_from(&cli), &cli).unwrap();
+
+        assert_eq!(args.listen, "127.0.0.1:5301".parse().unwrap());
+        assert_eq!(args.cache_size, 500);
+        assert!(args.verbose);
+        assert!(!args.clear);
+        assert_eq!(args.servers, [("Google", "https://8.8.8.8/dns-query")]);
+        assert_eq!(args.blocked_ttl, 60);
+    }
+
+    #[test]
+    fn config_without_cli_overrides_keeps_file_values() {
+        let path = write_config(
+            "config-servers.toml",
+            "servers = [\"quad9\", \"cloudflare\"]\nblocked-ttl = 5\n",
+        );
+        let cli = argv(&["-c", path.to_str().unwrap()]);
+        let args = with_config(Args::parse_from(&cli), &cli).unwrap();
+        assert_eq!(args.servers.len(), 2);
+        assert_eq!(args.blocked_ttl, 5);
+        assert!(with_config(args, &argv(&[])).is_ok());
+    }
+
+    #[test]
+    fn config_rejects_unknown_keys_bad_values_and_missing_files() {
+        for (name, content) in [
+            ("unknown.toml", "nope = 1"),
+            ("table.toml", "[section]\nkey = 1"),
+            ("array.toml", "servers = [1, 2]"),
+            ("type.toml", "cache_size = \"many\""),
+            ("syntax.toml", "listen ="),
+        ] {
+            let path = write_config(name, content);
+            let cli = argv(&["-c", path.to_str().unwrap()]);
+            assert!(
+                with_config(Args::parse_from(&cli), &cli).is_err(),
+                "{name}"
+            );
+        }
+        let cli = argv(&["-c", temp_path("missing.toml").to_str().unwrap()]);
+        assert!(with_config(Args::parse_from(&cli), &cli).is_err());
+    }
+
+    #[tokio::test]
+    async fn run_fails_cleanly_on_bad_config() {
+        let cli = argv(&["-c", temp_path("absent.toml").to_str().unwrap()]);
+        assert!(run(cli).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_prints_stats_and_exits() {
+        let db = temp_path("run-stats.db");
+        assert!(
+            run(argv(&["-d", db.to_str().unwrap(), "--stats"]))
+                .await
+                .is_ok()
+        );
     }
 }

@@ -44,7 +44,27 @@ Por defecto no registra cada consulta. Para ver consultas, aciertos de caché, b
 
 ```cargo run -- --verbose```
 
-Las respuestas se guardan en caché en memoria respetando su TTL (hasta 10.000 entradas). La blocklist se carga en memoria al iniciar y bloquea también los subdominios de cada dominio de la lista.
+Las respuestas se guardan en caché en memoria respetando su TTL (por defecto hasta 10.000 entradas, configurable con --cache-size). La blocklist se carga en memoria al iniciar y bloquea también los subdominios de cada dominio de la lista.
+
+Para elegir los servidores de la carrera (por defecto se usan los cinco) se usa --servers, con nombres predefinidos o servidores propios como NOMBRE=URL:
+
+```cargo run -- --servers cloudflare,quad9,mio=https://doh.ejemplo.com/dns-query```
+
+Todas las opciones están en `cargo run -- --help`.
+
+
+Configuración:
+
+Todas las opciones se pueden poner en un archivo TOML usando el nombre del flag como clave (`cache_size` o `cache-size`). Los flags de la línea de comandos tienen prioridad sobre el archivo. Hay un ejemplo comentado en `contrib/doh.toml`:
+
+```toml
+listen = "0.0.0.0:53"
+servers = ["cloudflare", "quad9"]
+cache_size = 20000
+stats_retention = 30
+```
+
+```cargo run -- --config doh.toml```
 
 
 Estadísticas:

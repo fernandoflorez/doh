@@ -1,0 +1,15 @@
+# Each key is a command line flag (cache_size and cache-size both work).
+# Flags given on the command line take precedence over this file.
+
+# db_path = "doh_blocklist.db"
+# listen = "127.0.0.1:53"
+
+# Built-in: google, cloudflare, quad9, opendns, mullvad. Custom: "NAME=URL".
+# servers = ["cloudflare", "quad9", "mine=https://doh.example.com/dns-query"]
+
+# upstream_timeout = 5   # seconds
+# cache_size = 10000     # entries
+# blocked_ttl = 60       # seconds
+# tcp_timeout = 10       # seconds
+# stats_retention = 60   # days
+# verbose = false
