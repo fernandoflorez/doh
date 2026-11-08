@@ -622,6 +622,12 @@ impl Resolver {
     }
 
     async fn resolve(&self, request: &Message) -> Option<Message> {
+        if request.message_type != MessageType::Query
+            || request.op_code != OpCode::Query
+        {
+            vlog!("Ignored a message that is not a standard query");
+            return None;
+        }
         let query = request.queries.first()?;
         let qtype = query.query_type();
         let Some(domain) = query_domain(query.name()) else {
@@ -1928,5 +1934,30 @@ mod tests {
         .await;
         assert!(res.unwrap_err().to_string().contains("unknown user"));
         assert!(!db.exists());
+    }
+
+    #[tokio::test]
+    async fn responses_and_non_query_opcodes_get_no_reply() {
+        let resolver =
+            resolver(blocked_db(Path::new(":memory:")), DOH_SERVERS);
+        let query = Message::from_bytes(&query_bytes(
+            "ads.example.com.",
+            RecordType::A,
+        ))
+        .unwrap();
+        assert!(resolver.resolve(&query).await.is_some());
+
+        // Una respuesta (QR=1) contestada formaba un bucle infinito entre dos
+        // resolvers con un solo datagrama de origen falsificado.
+        let mut response = query.clone();
+        response.metadata.message_type = MessageType::Response;
+        assert!(resolver.resolve(&response).await.is_none());
+
+        let mut notify = query.clone();
+        notify.metadata.op_code = OpCode::Notify;
+        assert!(resolver.resolve(&notify).await.is_none());
+
+        let addr = start(blocked_db(Path::new(":memory:")), DOH_SERVERS).await;
+        assert!(send_raw(addr, &response.to_vec().unwrap()).await.is_none());
     }
 }
