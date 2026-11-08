@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::net::UdpSocket;
 
 #[derive(Parser, Debug)]
@@ -84,7 +84,7 @@ async fn doh_race(
     .await?;
     println!("{} won", name);
 
-    if let Err(e) = db.lock().unwrap().execute(
+    if let Err(e) = db.lock().unwrap_or_else(PoisonError::into_inner).execute(
         "INSERT INTO fastest_servers (server_name) VALUES (?1)",
         params![name],
     ) {
@@ -163,7 +163,7 @@ async fn handle_request(
     let domain = qname.trim_end_matches('.');
     let is_blocked = db
         .lock()
-        .unwrap()
+        .unwrap_or_else(PoisonError::into_inner)
         .query_row(
             "SELECT 1 FROM blocklist WHERE domain = ?1",
             params![domain],
@@ -174,10 +174,12 @@ async fn handle_request(
     let mut response = if is_blocked {
         println!("Blocked domain: {}", domain);
 
-        if let Err(e) = db.lock().unwrap().execute(
-            "INSERT INTO blocked_requests (domain) VALUES (?1)",
-            params![domain],
-        ) {
+        if let Err(e) =
+            db.lock().unwrap_or_else(PoisonError::into_inner).execute(
+                "INSERT INTO blocked_requests (domain) VALUES (?1)",
+                params![domain],
+            )
+        {
             eprintln!("Error saving blocked request: {}", e);
         }
 
@@ -246,7 +248,13 @@ async fn serve(
 
     loop {
         let mut buf = [0u8; 512];
-        let (size, src) = socket.recv_from(&mut buf).await?;
+        let (size, src) = match socket.recv_from(&mut buf).await {
+            Ok(received) => received,
+            Err(e) => {
+                eprintln!("Error receiving request: {}", e);
+                continue;
+            }
+        };
         let data = buf[..size].to_vec();
         let (socket, client, db) =
             (Arc::clone(&socket), client.clone(), Arc::clone(&db));
@@ -596,5 +604,32 @@ mod tests {
                 .is_none()
         );
         assert!(send_raw(addr, &[0xff]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn race_works_with_poisoned_db_lock() {
+        let live = mock_doh(Ipv4Addr::new(1, 1, 1, 1)).await;
+        let servers = leak_servers(vec![("Live", live)]);
+        let db = Arc::new(Mutex::new(
+            setup_database(Path::new(":memory:")).unwrap(),
+        ));
+        // Un hilo entra en pánico con el lock tomado y lo deja envenenado.
+        let poisoner = Arc::clone(&db);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(db.is_poisoned());
+
+        let res = doh_race(
+            &Client::new(),
+            servers,
+            "example.com",
+            RecordType::A,
+            &db,
+        )
+        .await;
+        assert!(res.is_ok());
     }
 }
