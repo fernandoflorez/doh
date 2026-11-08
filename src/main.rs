@@ -500,6 +500,15 @@ impl Resolver {
         }
     }
 
+    fn points_to_blocked(&self, msg: &Message) -> bool {
+        msg.answers.iter().any(|record| match &record.data {
+            RData::CNAME(target) => {
+                query_domain(&target.0).is_some_and(|d| self.is_blocked(&d))
+            }
+            _ => false,
+        })
+    }
+
     fn record(&self, stat: Stat) {
         // ponytail: bounded queue, stats are dropped if the writer falls behind
         let _ = self.stats.try_send(stat);
@@ -614,8 +623,14 @@ impl Resolver {
                     Ok((msg, name)) => {
                         vlog!("{} won: {}", name, key.0);
                         self.record(Stat::Winner(name));
-                        self.store(key, &msg);
-                        msg
+                        if self.points_to_blocked(&msg) {
+                            vlog!("Blocked by CNAME: {}", key.0);
+                            self.record(Stat::Blocked(key.0));
+                            blocked_response(query, self.blocked_ttl)
+                        } else {
+                            self.store(key, &msg);
+                            msg
+                        }
                     }
                     Err(e) => {
                         vlog!("Error resolving {}: {}", key.0, e);
@@ -1726,5 +1741,65 @@ mod tests {
                 .is_some()
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Servidor DoH que responde cada query con un CNAME hacia `target`.
+    async fn mock_cname(target: &'static str) -> &'static str {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url =
+            format!("http://{}/dns-query", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    let start =
+                        buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap()
+                            + 4;
+                    let mut res = Message::from_bytes(&buf[start..n]).unwrap();
+                    res.metadata.message_type = MessageType::Response;
+                    let name = res.queries[0].name().clone();
+                    res.add_answer(Record::from_rdata(
+                        name,
+                        60,
+                        RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                            Name::from_ascii(target).unwrap(),
+                        )),
+                    ));
+                    let body = res.to_vec().unwrap();
+                    stream
+                        .write_all(&http_response("200 OK", "", &body))
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        Box::leak(url.into_boxed_str())
+    }
+
+    #[tokio::test]
+    async fn cname_to_a_blocked_domain_is_blocked() {
+        let db_path = temp_path("cname.db");
+        let cloaked = mock_cname("tracker.ads.example.com.").await;
+        let addr = start(
+            blocked_db(&db_path),
+            leak_servers(vec![("Cname", cloaked)]),
+        )
+        .await;
+
+        let res = ask(addr, "metrics.shop.com.", RecordType::A).await.unwrap();
+        assert_eq!(res.answers.len(), 1);
+        assert_eq!(
+            res.answers[0].data,
+            RData::A(Ipv4Addr::UNSPECIFIED.into())
+        );
+        wait_count(&db_path, "blocked_requests", 1);
+
+        let clean = mock_cname("cdn.example.net.").await;
+        let addr =
+            start(memory_db(), leak_servers(vec![("Cname", clean)])).await;
+        let res = ask(addr, "www.shop.com.", RecordType::A).await.unwrap();
+        assert!(matches!(res.answers[0].data, RData::CNAME(_)));
     }
 }
