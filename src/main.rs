@@ -74,6 +74,14 @@ struct Args {
     #[arg(long, value_name = "ENTRIES", default_value_t = 10_000)]
     cache_size: usize,
 
+    /// Maximum memory used by cached responses, in megabytes.
+    #[arg(long, value_name = "MB", default_value_t = 32)]
+    cache_max_mb: usize,
+
+    /// Upper limit in seconds for how long an answer stays cached.
+    #[arg(long, value_name = "SECONDS", default_value_t = 86_400)]
+    max_ttl: u32,
+
     /// TTL in seconds for the answers to blocked domains.
     #[arg(long, value_name = "SECONDS", default_value_t = 60)]
     blocked_ttl: u32,
@@ -104,6 +112,16 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Servers = &'static [(&'static str, &'static str)];
 type CacheKey = (String, RecordType);
 
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<CacheKey, (Vec<u8>, Instant)>,
+    bytes: usize,
+}
+
+fn entry_size(key: &CacheKey, bytes: &[u8]) -> usize {
+    key.0.len() + bytes.len()
+}
+
 const DOH_SERVERS: Servers = &[
     ("Google", "https://8.8.8.8/dns-query"),
     ("Cloudflare", "https://1.1.1.1/dns-query"),
@@ -133,9 +151,11 @@ struct Resolver {
     client: Client,
     servers: Servers,
     blocklist: HashSet<Box<str>>,
-    cache: Mutex<HashMap<CacheKey, (Vec<u8>, Instant)>>,
+    cache: Mutex<Cache>,
     stats: SyncSender<Stat>,
     cache_size: usize,
+    cache_max_bytes: usize,
+    max_ttl: u32,
     blocked_ttl: u32,
     tcp_timeout: Duration,
     max_tcp_connections: usize,
@@ -458,6 +478,8 @@ impl Resolver {
             cache: Mutex::default(),
             stats: spawn_stats_writer(conn, args.stats_retention),
             cache_size: args.cache_size,
+            cache_max_bytes: args.cache_max_mb.saturating_mul(1024 * 1024),
+            max_ttl: args.max_ttl,
             blocked_ttl: args.blocked_ttl,
             tcp_timeout: Duration::from_secs(args.tcp_timeout),
             max_tcp_connections: args.max_tcp_connections,
@@ -488,6 +510,7 @@ impl Resolver {
             .cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .entries
             .get(key)
             .cloned()?;
         let remaining = expires.checked_duration_since(Instant::now())?;
@@ -523,22 +546,44 @@ impl Resolver {
         let Ok(bytes) = msg.to_vec() else {
             return;
         };
-        if ttl == 0 {
+        let size = entry_size(&key, &bytes);
+        if ttl == 0 || size > self.cache_max_bytes {
             return;
         }
 
         let now = Instant::now();
         let mut cache =
             self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= self.cache_size {
-            cache.retain(|_, (_, expires)| *expires > now);
-            // ponytail: no LRU, a cache full of live entries is wiped; add LRU
-            // if the hit rate suffers
-            if cache.len() >= self.cache_size {
-                cache.clear();
+        if let Some((old, _)) = cache.entries.remove(&key) {
+            cache.bytes -= entry_size(&key, &old);
+        }
+        let full = |c: &Cache| {
+            c.entries.len() >= self.cache_size
+                || c.bytes + size > self.cache_max_bytes
+        };
+        if full(&cache) {
+            cache.entries.retain(|_, (_, expires)| *expires > now);
+            cache.bytes = cache
+                .entries
+                .iter()
+                .map(|(k, (b, _))| entry_size(k, b))
+                .sum();
+        }
+        // ponytail: evicts arbitrary live entries, not LRU; add LRU if the
+        // hit rate suffers
+        while full(&cache) {
+            let Some(victim) = cache.entries.keys().next().cloned() else {
+                break;
+            };
+            if let Some((old, _)) = cache.entries.remove(&victim) {
+                cache.bytes -= entry_size(&victim, &old);
             }
         }
-        cache.insert(key, (bytes, now + Duration::from_secs(ttl.into())));
+        let ttl = ttl.min(self.max_ttl);
+        cache.bytes += size;
+        cache
+            .entries
+            .insert(key, (bytes, now + Duration::from_secs(ttl.into())));
     }
 
     async fn resolve(&self, request: &Message) -> Option<Message> {
@@ -775,6 +820,8 @@ mod tests {
             servers: vec![],
             upstream_timeout: 5,
             cache_size: 10_000,
+            cache_max_mb: 32,
+            max_ttl: 86_400,
             blocked_ttl: 60,
             tcp_timeout: 10,
             max_tcp_connections: 256,
@@ -1055,7 +1102,7 @@ mod tests {
         resolver.store(key("zero.com"), &a_response(0));
         resolver.store(key("empty.com"), &Message::response(1, OpCode::Query));
 
-        assert!(resolver.cache.lock().unwrap().is_empty());
+        assert!(resolver.cache.lock().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -1066,6 +1113,7 @@ mod tests {
             .cache
             .lock()
             .unwrap()
+            .entries
             .insert(key("old.com"), (bytes, Instant::now()));
         std::thread::sleep(Duration::from_millis(5));
         assert!(resolver.cached(&key("old.com")).is_none());
@@ -1079,9 +1127,36 @@ mod tests {
         for i in 0..100 {
             resolver.store(key(&format!("d{i}.com")), &msg);
         }
-        assert_eq!(resolver.cache.lock().unwrap().len(), 100);
+        assert_eq!(resolver.cache.lock().unwrap().entries.len(), 100);
         resolver.store(key("one-more.com"), &msg);
-        assert_eq!(resolver.cache.lock().unwrap().len(), 1);
+        let cache = resolver.cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 100);
+        assert!(cache.entries.contains_key(&key("one-more.com")));
+    }
+
+    #[test]
+    fn cache_respects_byte_budget_and_max_ttl() {
+        let mut resolver = resolver(memory_db(), DOH_SERVERS);
+        let msg = a_response(300);
+        let size = entry_size(&key("d0.com"), &msg.to_vec().unwrap());
+        resolver.cache_max_bytes = size * 3;
+        resolver.max_ttl = 60;
+        for i in 0..10 {
+            resolver.store(key(&format!("d{i}.com")), &msg);
+        }
+        {
+            let cache = resolver.cache.lock().unwrap();
+            assert_eq!(cache.entries.len(), 3);
+            assert_eq!(cache.bytes, size * 3);
+        }
+        resolver.store(key("d9.com"), &msg);
+        assert_eq!(resolver.cache.lock().unwrap().bytes, size * 3);
+        let ttl = resolver.cached(&key("d9.com")).unwrap().answers[0].ttl;
+        assert!(ttl <= 60, "ttl = {ttl}");
+
+        resolver.cache_max_bytes = size - 1;
+        resolver.store(key("big.com"), &msg);
+        assert!(resolver.cached(&key("big.com")).is_none());
     }
 
     #[tokio::test]
