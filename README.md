@@ -38,6 +38,14 @@ Para escuchar en otra dirección o puerto se usa --listen:
 
 ```dig @127.0.0.1 -p 5300 example.com```
 
+Atiende consultas por UDP y TCP. Las respuestas que no entran en UDP se marcan como truncadas para que el cliente reintente por TCP.
+
+Por defecto no registra cada consulta. Para ver consultas, aciertos de caché, bloqueos y el servidor ganador:
+
+```cargo run -- --verbose```
+
+Las respuestas se guardan en caché en memoria respetando su TTL (hasta 10.000 entradas). La blocklist se carga en memoria al iniciar y bloquea también los subdominios de cada dominio de la lista.
+
 
 Ideas para después:
 
