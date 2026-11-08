@@ -376,6 +376,19 @@ fn print_stats(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn query_domain(name: &Name) -> Option<String> {
+    let labels = name
+        .iter()
+        .map(|label| {
+            label
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                .then(|| String::from_utf8_lossy(label).to_ascii_lowercase())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(labels.join("."))
+}
+
 fn blocked_response(query: &Query, ttl: u32) -> Message {
     let mut response = Message::response(0, OpCode::Query);
     response.metadata.recursion_desired = true;
@@ -492,11 +505,10 @@ impl Resolver {
     async fn resolve(&self, request: &Message) -> Option<Message> {
         let query = request.queries.first()?;
         let qtype = query.query_type();
-        let domain = query
-            .name()
-            .to_utf8()
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
+        let Some(domain) = query_domain(query.name()) else {
+            vlog!("Rejected query with unsupported characters in its name");
+            return None;
+        };
         vlog!("Query: {} {:?}", domain, qtype);
 
         let mut response = if self.is_blocked(&domain) {
@@ -1312,5 +1324,112 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    fn raw_query(labels: &[&[u8]], qtype: RecordType) -> Vec<u8> {
+        let mut msg = Message::query();
+        msg.metadata.id = 4242;
+        let name = Name::from_labels(labels.iter().copied()).unwrap();
+        msg.add_query(Query::query(name, qtype));
+        msg.to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn dot_inside_label_does_not_bypass_blocklist() {
+        let (live, hits) = mock_doh(Ipv4Addr::new(1, 2, 3, 4), 1).await;
+        let addr = start(
+            blocked_db(&temp_path("dot-label.db")),
+            leak_servers(vec![("Live", live)]),
+        )
+        .await;
+
+        // Un byte '.' dentro del último label se escapaba como "\." y el
+        // trim del punto final dejaba "ads.example.com\", que no matcheaba
+        // la blocklist pero se reenviaba como ads.example.com.
+        let variants: [&[&[u8]]; 2] = [
+            &[b"ads", b"example", b"com."],
+            &[b"ads", b"example", b"com", b"."],
+        ];
+        for labels in variants {
+            let res = send_raw(addr, &raw_query(labels, RecordType::A)).await;
+            let leaked = res.is_some_and(|r| {
+                r.answers.iter().any(|a| {
+                    a.data == RData::A(Ipv4Addr::new(1, 2, 3, 4).into())
+                })
+            });
+            assert!(!leaked, "blocked domain resolved for {labels:?}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn control_characters_never_reach_stats() {
+        let db_path = temp_path("control-chars.db");
+        let addr = start(
+            blocked_db(&db_path),
+            leak_servers(vec![("Dead", dead_url())]),
+        )
+        .await;
+
+        // Label punycode con ESC en sus code points básicos, bajo un dominio
+        // bloqueado; luego una consulta normal que marca el final.
+        let evil: &[&[u8]] =
+            &[b"xn--\x1b[2K\x1b[1A\x1b[2K-olb", b"ads", b"example", b"com"];
+        send_raw(addr, &raw_query(evil, RecordType::A)).await;
+        ask(addr, "ads.example.com.", RecordType::A).await.unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let domains: Vec<String> = (0..100)
+            .find_map(|_| {
+                let mut stmt = conn
+                    .prepare("SELECT domain FROM blocked_requests")
+                    .unwrap();
+                let rows: Vec<String> = stmt
+                    .query_map((), |r| r.get(0))
+                    .unwrap()
+                    .map(|d| d.unwrap())
+                    .collect();
+                if rows.iter().any(|d| d == "ads.example.com") {
+                    return Some(rows);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                None
+            })
+            .expect("stats never written");
+        for domain in &domains {
+            assert!(
+                !domain.chars().any(char::is_control),
+                "control characters stored: {domain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_domain_lowercases_and_rejects_unsafe_labels() {
+        let name = |labels: &[&[u8]]| {
+            Name::from_labels(labels.iter().copied()).unwrap()
+        };
+        assert_eq!(
+            query_domain(&name(&[b"WWW", b"Example", b"COM"])).as_deref(),
+            Some("www.example.com")
+        );
+        assert_eq!(
+            query_domain(&name(&[b"_dmarc", b"my-site", b"org"])).as_deref(),
+            Some("_dmarc.my-site.org")
+        );
+        // Los IDN se mantienen en punycode en vez de decodificarse.
+        assert_eq!(
+            query_domain(&name(&[b"xn--bcher-kva", b"example"])).as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(query_domain(&Name::root()).as_deref(), Some(""));
+        for bad in [
+            &[b"com." as &[u8]][..],
+            &[b"xn--\x1b[2K-olb", b"ads"],
+            &[b"a b", b"com"],
+            &[b"caf\xc3\xa9", b"com"],
+        ] {
+            assert_eq!(query_domain(&name(bad)), None, "{bad:?}");
+        }
     }
 }
