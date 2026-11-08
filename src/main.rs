@@ -529,7 +529,7 @@ impl Resolver {
     fn points_to_blocked(&self, msg: &Message) -> bool {
         msg.answers.iter().any(|record| match &record.data {
             RData::CNAME(target) => {
-                query_domain(&target.0).is_some_and(|d| self.is_blocked(&d))
+                query_domain(&target.0).is_none_or(|d| self.is_blocked(&d))
             }
             _ => false,
         })
@@ -1870,6 +1870,19 @@ mod tests {
             RData::A(Ipv4Addr::UNSPECIFIED.into())
         );
         wait_count(&db_path, "blocked_requests", 1);
+
+        // Un destino con bytes fuera de LDH no puede esconder al padre
+        // bloqueado: se trata como bloqueado.
+        let db_odd = temp_path("cname-odd.db");
+        let odd = mock_cname("a\\.b.ads.example.com.").await;
+        let addr =
+            start(blocked_db(&db_odd), leak_servers(vec![("Cname", odd)]))
+                .await;
+        let res = ask(addr, "metrics.shop.com.", RecordType::A).await.unwrap();
+        assert_eq!(
+            res.answers[0].data,
+            RData::A(Ipv4Addr::UNSPECIFIED.into())
+        );
 
         let clean = mock_cname("cdn.example.net.").await;
         let addr =
