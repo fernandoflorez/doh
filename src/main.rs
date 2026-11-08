@@ -597,12 +597,14 @@ impl Resolver {
                 || c.bytes + size > self.cache_max_bytes
         };
         if full(&cache) {
-            cache.entries.retain(|_, (_, expires)| *expires > now);
-            cache.bytes = cache
-                .entries
-                .iter()
-                .map(|(k, (b, _))| entry_size(k, b))
-                .sum();
+            let Cache { entries, bytes } = &mut *cache;
+            entries.retain(|k, (b, expires)| {
+                let live = *expires > now;
+                if !live {
+                    *bytes -= entry_size(k, b);
+                }
+                live
+            });
         }
         // ponytail: evicts arbitrary live entries, not LRU; add LRU if the
         // hit rate suffers
@@ -783,29 +785,20 @@ async fn serve(
     );
 }
 
-fn prepare(args: &Args) -> Result<Option<Connection>, BoxError> {
-    let mut conn = setup_database(&args.db_path)?;
-
+fn maintain(args: &Args, conn: &mut Connection) -> Result<(), BoxError> {
     if args.clear {
         conn.execute("DELETE FROM blocklist", ())?;
         println!("Blocklist cleared.");
-        return Ok(None);
-    }
-
-    if args.stats {
-        print_stats(&conn)?;
-        return Ok(None);
-    }
-
-    if let Some(path) = &args.blocklist {
+    } else if args.stats {
+        print_stats(conn)?;
+    } else if let Some(path) = &args.blocklist {
         println!("Loading blocklist from: {:?}", path);
         load_blocklist_from_reader(
-            &mut conn,
+            conn,
             io::BufReader::new(File::open(path)?),
         )?;
-        return Ok(None);
     }
-    Ok(Some(conn))
+    Ok(())
 }
 
 fn drop_privileges(user: &str) -> Result<(), BoxError> {
@@ -848,11 +841,9 @@ async fn run(argv: Vec<OsString>) -> Result<(), BoxError> {
     if let Some(user) = &args.user {
         drop_privileges(user)?;
     }
-    let Some(conn) = prepare(&args)? else {
-        return Ok(());
-    };
+    let mut conn = setup_database(&args.db_path)?;
     let Some((socket, listener)) = sockets else {
-        return Ok(());
+        return maintain(&args, &mut conn);
     };
     let resolver = Resolver::new(conn, &args)?;
     println!("DNS server listening on {}", args.listen);
@@ -890,6 +881,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    fn maintain_db(args: &Args) -> Result<(), BoxError> {
+        maintain(args, &mut setup_database(&args.db_path)?)
     }
 
     fn memory_db() -> Connection {
@@ -952,21 +947,22 @@ mod tests {
         Box::leak(url.into_boxed_str())
     }
 
-    /// Servidor DoH mínimo: responde cada query con `records` registros A
-    /// fijos (TTL 60) y cuenta cuántas peticiones recibió.
-    async fn mock_doh(
-        answer: Ipv4Addr,
-        records: usize,
+    /// Servidor HTTP mínimo: lee cada petición completa, cuenta cuántas
+    /// recibió y responde los bytes que devuelve `reply` para su cuerpo.
+    async fn mock_http(
+        reply: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
     ) -> (&'static str, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url =
             format!("http://{}/dns-query", listener.local_addr().unwrap());
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
+        let reply = Arc::new(reply);
         tokio::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 counter.fetch_add(1, Ordering::SeqCst);
+                let reply = Arc::clone(&reply);
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 1024];
@@ -983,10 +979,7 @@ mod tests {
                                 .find_map(|l| {
                                     l.strip_prefix("content-length:")
                                 })
-                                .unwrap()
-                                .trim()
-                                .parse()
-                                .unwrap();
+                                .map_or(0, |v| v.trim().parse().unwrap());
                             break (i + 4, len);
                         }
                     };
@@ -994,29 +987,38 @@ mod tests {
                         let n = stream.read(&mut chunk).await.unwrap();
                         buf.extend_from_slice(&chunk[..n]);
                     }
-
-                    let mut res =
-                        Message::from_bytes(&buf[start..start + len]).unwrap();
-                    res.metadata.message_type = MessageType::Response;
-                    let name = res.queries[0].name().clone();
-                    for _ in 0..records {
-                        res.add_answer(Record::from_rdata(
-                            name.clone(),
-                            60,
-                            RData::A(answer.into()),
-                        ));
-                    }
-                    let body = res.to_vec().unwrap();
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    stream.write_all(head.as_bytes()).await.unwrap();
-                    stream.write_all(&body).await.unwrap();
+                    let _ = stream
+                        .write_all(&reply(&buf[start..start + len]))
+                        .await;
                 });
             }
         });
         (Box::leak(url.into_boxed_str()), hits)
+    }
+
+    /// Respuesta DoH 200 a la query recibida, con los registros de `answer`.
+    fn doh_reply(
+        query: &[u8],
+        answer: impl Fn(&Name) -> Vec<RData>,
+    ) -> Vec<u8> {
+        let mut res = Message::from_bytes(query).unwrap();
+        res.metadata.message_type = MessageType::Response;
+        let name = res.queries[0].name().clone();
+        for data in answer(&name) {
+            res.add_answer(Record::from_rdata(name.clone(), 60, data));
+        }
+        http_response("200 OK", "", &res.to_vec().unwrap())
+    }
+
+    /// Servidor DoH que responde `records` registros A fijos (TTL 60).
+    async fn mock_doh(
+        answer: Ipv4Addr,
+        records: usize,
+    ) -> (&'static str, Arc<AtomicUsize>) {
+        mock_http(move |q| {
+            doh_reply(q, |_| vec![RData::A(answer.into()); records])
+        })
+        .await
     }
 
     async fn start(conn: Connection, servers: Servers) -> SocketAddr {
@@ -1111,30 +1113,30 @@ mod tests {
     }
 
     #[test]
-    fn prepare_loads_blocklist_then_clear_empties_it() {
+    fn maintain_loads_blocklist_then_clear_empties_it() {
         let db_path = temp_path("prepare.db");
         let list_path = temp_path("list.txt");
         std::fs::write(&list_path, "a.example.com\nb.example.com\n").unwrap();
 
         let mut args = args(db_path.clone());
         args.blocklist = Some(list_path);
-        assert!(prepare(&args).unwrap().is_none());
+        maintain_db(&args).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocklist"), 2);
         drop(conn);
 
         args.blocklist = None;
         args.clear = true;
-        assert!(prepare(&args).unwrap().is_none());
+        maintain_db(&args).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocklist"), 0);
     }
 
     #[test]
-    fn prepare_fails_on_missing_blocklist_file() {
+    fn maintain_fails_on_missing_blocklist_file() {
         let mut args = args(PathBuf::from(":memory:"));
         args.blocklist = Some(temp_path("missing.txt"));
-        assert!(prepare(&args).is_err());
+        assert!(maintain_db(&args).is_err());
     }
 
     #[test]
@@ -1421,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_with_stats_prints_report_and_exits() {
+    fn maintain_with_stats_prints_report_and_exits() {
         let db_path = temp_path("report.db");
         let conn = setup_database(&db_path).unwrap();
         conn.execute_batch(
@@ -1434,7 +1436,7 @@ mod tests {
 
         let mut args = args(db_path);
         args.stats = true;
-        assert!(prepare(&args).unwrap().is_none());
+        maintain_db(&args).unwrap();
     }
 
     fn argv(args: &[&str]) -> Vec<OsString> {
@@ -1655,23 +1657,9 @@ mod tests {
         }
     }
 
-    /// Servidor HTTP mínimo que responde siempre los mismos bytes crudos.
+    /// Servidor HTTP que responde siempre los mismos bytes crudos.
     async fn mock_raw(response: Vec<u8>) -> &'static str {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url =
-            format!("http://{}/dns-query", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let response = response.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let _ = stream.write_all(&response).await;
-                });
-            }
-        });
-        Box::leak(url.into_boxed_str())
+        mock_http(move |_| response.clone()).await.0
     }
 
     fn http_response(status: &str, extra: &str, body: &[u8]) -> Vec<u8> {
@@ -1820,37 +1808,15 @@ mod tests {
 
     /// Servidor DoH que responde cada query con un CNAME hacia `target`.
     async fn mock_cname(target: &'static str) -> &'static str {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url =
-            format!("http://{}/dns-query", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = stream.read(&mut buf).await.unwrap();
-                    let start =
-                        buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap()
-                            + 4;
-                    let mut res = Message::from_bytes(&buf[start..n]).unwrap();
-                    res.metadata.message_type = MessageType::Response;
-                    let name = res.queries[0].name().clone();
-                    res.add_answer(Record::from_rdata(
-                        name,
-                        60,
-                        RData::CNAME(hickory_proto::rr::rdata::CNAME(
-                            Name::from_ascii(target).unwrap(),
-                        )),
-                    ));
-                    let body = res.to_vec().unwrap();
-                    stream
-                        .write_all(&http_response("200 OK", "", &body))
-                        .await
-                        .unwrap();
-                });
-            }
-        });
-        Box::leak(url.into_boxed_str())
+        mock_http(move |q| {
+            doh_reply(q, |_| {
+                vec![RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                    Name::from_ascii(target).unwrap(),
+                ))]
+            })
+        })
+        .await
+        .0
     }
 
     #[tokio::test]
