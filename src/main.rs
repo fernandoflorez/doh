@@ -50,7 +50,7 @@ struct Args {
     listen: SocketAddr,
 
     /// DoH servers to race, comma separated: google, cloudflare, quad9,
-    /// opendns, mullvad or NAME=URL. Defaults to the five built-in ones.
+    /// opendns or NAME=URL. Defaults to all the built-in ones.
     #[arg(
         short,
         long,
@@ -98,7 +98,6 @@ const DOH_SERVERS: Servers = &[
     ("Cloudflare", "https://1.1.1.1/dns-query"),
     ("Quad9", "https://9.9.9.9/dns-query"),
     ("OpenDNS", "https://208.67.222.222/dns-query"),
-    ("Mullvad", "https://194.242.2.2/dns-query"),
 ];
 const STATS_QUEUE: usize = 4096;
 const PURGE_EVERY: Duration = Duration::from_secs(3600);
@@ -1221,13 +1220,13 @@ mod tests {
     fn servers_accept_builtin_names_and_custom_urls() {
         let args = Args::parse_from(argv(&[
             "--servers",
-            "cloudflare,MULLVAD,mine=https://doh.example.com/dns-query",
+            "cloudflare,OPENDNS,mine=https://doh.example.com/dns-query",
         ]));
         assert_eq!(
             select_servers(&args.servers),
             [
                 ("Cloudflare", "https://1.1.1.1/dns-query"),
-                ("Mullvad", "https://194.242.2.2/dns-query"),
+                ("OpenDNS", "https://208.67.222.222/dns-query"),
                 ("mine", "https://doh.example.com/dns-query"),
             ]
         );

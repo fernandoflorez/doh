@@ -4,7 +4,7 @@
 # db_path = "doh_blocklist.db"
 # listen = "127.0.0.1:53"
 
-# Built-in: google, cloudflare, quad9, opendns, mullvad. Custom: "NAME=URL".
+# Built-in: google, cloudflare, quad9, opendns. Custom: "NAME=URL".
 # servers = ["cloudflare", "quad9", "mine=https://doh.example.com/dns-query"]
 
 # upstream_timeout = 5   # seconds

@@ -9,7 +9,6 @@ It listens for regular DNS queries (UDP and TCP) and races every configured DoH 
 - Cloudflare (1.1.1.1)
 - Quad9 (9.9.9.9)
 - OpenDNS (208.67.222.222)
-- Mullvad (194.242.2.2)
 
 Features:
 
