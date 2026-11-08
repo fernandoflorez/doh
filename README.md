@@ -124,6 +124,40 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/local.doh.plist
 The blocklist is loaded when the service starts, so restart it after importing a new list into its database with `--db-path`.
 
 
+## Benchmark
+
+Compared with two popular open source ad-blocking DNS proxies, using the same four DoH upstreams, the same blocklist (AdguardDNS from firebog, 190k domains) and default cache settings. Median of three rounds on an Apple M4 Pro (12 cores, 24 GB), macOS 27.0.1, November 2026.
+
+| | doh | Blocky v0.35.0 | AdGuard Home v0.107.80 |
+|---|---|---|---|
+| Cached queries | **112,583 qps** | 89,032 qps | 89,956 qps |
+| Blocked queries | 84,730 qps | 89,925 qps | **90,561 qps** |
+| Uncached latency p50 | 9.1 ms | 14.3 ms | **6.5 ms** |
+| Uncached latency p95 | **44.4 ms** | 137.6 ms | 86.8 ms |
+| Uncached latency p99 | **116.0 ms** | 327.2 ms | 216.8 ms |
+| Memory at startup | **34.8 MB** | 52.9 MB | 78.5 MB |
+| Memory after the run | **43.6 MB** | 77.6 MB | 113.0 MB |
+| Binary size | **4.7 MB** | 32.3 MB | 33.1 MB |
+
+How it was measured:
+
+- Throughput: `dnsperf` for 10 seconds with 4 clients and 200 outstanding queries, against 100 popular domains already in cache and against 1,000 blocked domains.
+- Latency: 1,000 popular domains not in the proxy cache, at 100 queries per second. Before measuring, `bench/prime.sh` warms up the upstream servers' caches so the proxy that runs first is not penalized.
+- AdGuard Home ran with its rate limit disabled and query log off; Blocky with its default `parallel_best` strategy.
+- doh runs on a single thread; Blocky and AdGuard Home use every core.
+
+Blocky and AdGuard Home do much more (web interface, query log, per-client rules), so this compares the DNS path only.
+
+To reproduce, install [dnsperf](https://github.com/DNS-OARC/dnsperf), start the proxy on a local port and run:
+
+```sh
+bench/prime.sh
+bench/bench.sh doh 5300 <PID>
+```
+
+The query lists in `bench/` come from the [Tranco](https://tranco-list.eu) top sites list and the AdguardDNS blocklist.
+
+
 ## Notes
 
 This does not prevent DNS leaks.
