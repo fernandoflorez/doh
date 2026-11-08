@@ -65,6 +65,11 @@ struct Args {
     #[arg(long, value_name = "SECONDS", default_value_t = 5)]
     upstream_timeout: u64,
 
+    /// Maximum number of queries waiting on DoH servers at the same time;
+    /// further cache misses are dropped until one finishes.
+    #[arg(long, value_name = "QUERIES", default_value_t = 256)]
+    max_upstream_queries: usize,
+
     /// Maximum number of cached responses.
     #[arg(long, value_name = "ENTRIES", default_value_t = 10_000)]
     cache_size: usize,
@@ -134,6 +139,7 @@ struct Resolver {
     blocked_ttl: u32,
     tcp_timeout: Duration,
     max_tcp_connections: usize,
+    upstream_slots: Semaphore,
 }
 
 fn parse_server(value: &str) -> Result<(&'static str, &'static str), String> {
@@ -455,6 +461,7 @@ impl Resolver {
             blocked_ttl: args.blocked_ttl,
             tcp_timeout: Duration::from_secs(args.tcp_timeout),
             max_tcp_connections: args.max_tcp_connections,
+            upstream_slots: Semaphore::new(args.max_upstream_queries),
         })
     }
 
@@ -553,6 +560,10 @@ impl Resolver {
                 vlog!("Cache hit: {}", key.0);
                 cached
             } else {
+                let Ok(_slot) = self.upstream_slots.try_acquire() else {
+                    vlog!("Upstream query limit reached, dropping {}", key.0);
+                    return None;
+                };
                 match doh_race(&self.client, self.servers, &key.0, qtype).await
                 {
                     Ok((msg, name)) => {
@@ -767,6 +778,7 @@ mod tests {
             blocked_ttl: 60,
             tcp_timeout: 10,
             max_tcp_connections: 256,
+            max_upstream_queries: 256,
             stats: false,
             stats_retention: 60,
             verbose: false,
@@ -1601,5 +1613,43 @@ mod tests {
         sleep(Duration::from_millis(50)).await;
         let freed = ask_tcp(addr, "ads.example.com.", RecordType::A).await;
         assert_eq!(freed.answers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_misses_beyond_the_upstream_limit_are_dropped() {
+        let (live, hits) = mock_doh(Ipv4Addr::new(1, 2, 3, 4), 1).await;
+        let mut limited = resolver(
+            blocked_db(Path::new(":memory:")),
+            leak_servers(vec![("Live", live)]),
+        );
+        limited.upstream_slots = Semaphore::new(1);
+        let request = |name: &str| {
+            Message::from_bytes(&query_bytes(name, RecordType::A)).unwrap()
+        };
+
+        let busy = limited.upstream_slots.try_acquire().unwrap();
+        assert!(
+            limited
+                .resolve(&request("good.example.com."))
+                .await
+                .is_none()
+        );
+        // Bloqueados y cacheados no necesitan cupo upstream.
+        assert!(
+            limited
+                .resolve(&request("ads.example.com."))
+                .await
+                .is_some()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        drop(busy);
+        assert!(
+            limited
+                .resolve(&request("good.example.com."))
+                .await
+                .is_some()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }
