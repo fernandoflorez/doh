@@ -47,10 +47,19 @@ Por defecto no registra cada consulta. Para ver consultas, aciertos de caché, b
 Las respuestas se guardan en caché en memoria respetando su TTL (hasta 10.000 entradas). La blocklist se carga en memoria al iniciar y bloquea también los subdominios de cada dominio de la lista.
 
 
+Estadísticas:
+
+Se guarda qué proveedor ganó cada carrera y cada dominio bloqueado. Para verlas:
+
+```cargo run -- --stats```
+
+Por defecto se conservan 60 días; las entradas más viejas se borran automáticamente. Para cambiarlo:
+
+```cargo run -- --stats-retention 30```
+
+
 Ideas para después:
 
-- [ ] Poder tener estadísticas de cuál proveedor de DNS es más rápido
-- [ ] Poder tener estadísticas de bloqueos por hostname
 - [ ] Servicio de autostart para iniciado automático
 
 **Importante: Esto no evita DNS leaks**

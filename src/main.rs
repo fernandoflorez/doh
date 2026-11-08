@@ -11,7 +11,7 @@ use std::io::{self, BufRead};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,6 +41,14 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:53")]
     listen: SocketAddr,
 
+    /// Print the stored statistics and exit.
+    #[arg(long)]
+    stats: bool,
+
+    /// Days of statistics to keep; older entries are deleted.
+    #[arg(long, value_name = "DAYS", default_value_t = 60)]
+    stats_retention: u32,
+
     /// Log every query, cache hit, blocked domain and winning server.
     #[arg(short, long)]
     verbose: bool,
@@ -61,6 +69,7 @@ const CACHE_CAPACITY: usize = 10_000;
 const BLOCKED_TTL: u32 = 60;
 const STATS_QUEUE: usize = 4096;
 const TCP_IDLE: Duration = Duration::from_secs(10);
+const PURGE_EVERY: Duration = Duration::from_secs(3600);
 
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 
@@ -131,12 +140,12 @@ fn setup_database(db_path: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS fastest_servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             server_name TEXT NOT NULL,
-            timestamp INTEGER NOT NULL DEFAULT (unixepoch())
+            timestamp INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
         );
         CREATE TABLE IF NOT EXISTS blocked_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             domain TEXT NOT NULL,
-            timestamp INTEGER NOT NULL DEFAULT (unixepoch())
+            timestamp INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER))
         );
         CREATE INDEX IF NOT EXISTS idx_fastest_servers_timestamp
             ON fastest_servers (timestamp);
@@ -201,10 +210,39 @@ fn write_stats(
     transaction.commit()
 }
 
-fn spawn_stats_writer(mut conn: Connection) -> SyncSender<Stat> {
+fn purge_stats(conn: &Connection, retention_days: u32) -> Result<()> {
+    let cutoff = format!("-{retention_days} days");
+    for table in ["fastest_servers", "blocked_requests"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                WHERE timestamp < CAST(strftime('%s', 'now', ?1) AS INTEGER)"
+            ),
+            params![cutoff],
+        )?;
+    }
+    Ok(())
+}
+
+fn spawn_stats_writer(
+    mut conn: Connection,
+    retention_days: u32,
+) -> SyncSender<Stat> {
     let (sender, receiver) = sync_channel(STATS_QUEUE);
     std::thread::spawn(move || {
-        while let Ok(first) = receiver.recv() {
+        let mut last_purge: Option<Instant> = None;
+        loop {
+            if last_purge.is_none_or(|t| t.elapsed() >= PURGE_EVERY) {
+                if let Err(e) = purge_stats(&conn, retention_days) {
+                    eprintln!("Error purging stats: {}", e);
+                }
+                last_purge = Some(Instant::now());
+            }
+            let first = match receiver.recv_timeout(PURGE_EVERY) {
+                Ok(stat) => stat,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
             let batch = std::iter::once(first).chain(receiver.try_iter());
             if let Err(e) = write_stats(&mut conn, batch) {
                 eprintln!("Error saving stats: {}", e);
@@ -212,6 +250,32 @@ fn spawn_stats_writer(mut conn: Connection) -> SyncSender<Stat> {
         }
     });
     sender
+}
+
+fn print_stats(conn: &Connection) -> Result<()> {
+    println!("Fastest servers:");
+    let mut stmt = conn.prepare(
+        "SELECT server_name, COUNT(*), COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ()
+        FROM fastest_servers GROUP BY server_name ORDER BY 2 DESC",
+    )?;
+    let mut rows = stmt.query(())?;
+    while let Some(row) = rows.next()? {
+        let (name, wins, pct): (String, i64, f64) =
+            (row.get(0)?, row.get(1)?, row.get(2)?);
+        println!("  {name:<12} {wins:>8} {pct:>6.1}%");
+    }
+
+    println!("Most blocked domains:");
+    let mut stmt = conn.prepare(
+        "SELECT domain, COUNT(*) FROM blocked_requests
+        GROUP BY domain ORDER BY 2 DESC LIMIT 10",
+    )?;
+    let mut rows = stmt.query(())?;
+    while let Some(row) = rows.next()? {
+        let (domain, blocks): (String, i64) = (row.get(0)?, row.get(1)?);
+        println!("  {domain:<40} {blocks:>8}");
+    }
+    Ok(())
 }
 
 fn blocked_response(query: &Query) -> Message {
@@ -234,7 +298,11 @@ fn blocked_response(query: &Query) -> Message {
 }
 
 impl Resolver {
-    fn new(conn: Connection, servers: Servers) -> Result<Self> {
+    fn new(
+        conn: Connection,
+        servers: Servers,
+        retention_days: u32,
+    ) -> Result<Self> {
         let blocklist = load_blocklist(&conn)?;
         println!("{} blocked domains in memory", blocklist.len());
         Ok(Self {
@@ -242,7 +310,7 @@ impl Resolver {
             servers,
             blocklist,
             cache: Mutex::default(),
-            stats: spawn_stats_writer(conn),
+            stats: spawn_stats_writer(conn, retention_days),
         })
     }
 
@@ -466,6 +534,11 @@ fn prepare(args: &Args) -> Result<Option<Connection>, BoxError> {
         return Ok(None);
     }
 
+    if args.stats {
+        print_stats(&conn)?;
+        return Ok(None);
+    }
+
     if let Some(path) = &args.blocklist {
         println!("Loading blocklist from: {:?}", path);
         load_blocklist_from_reader(
@@ -483,7 +556,7 @@ async fn main() -> Result<(), BoxError> {
     let Some(conn) = prepare(&args)? else {
         return Ok(());
     };
-    let resolver = Resolver::new(conn, DOH_SERVERS)?;
+    let resolver = Resolver::new(conn, DOH_SERVERS, args.stats_retention)?;
     let socket = UdpSocket::bind(args.listen).await?;
     let listener = TcpListener::bind(args.listen).await?;
     println!("DNS server listening on {}", args.listen);
@@ -522,6 +595,8 @@ mod tests {
             blocklist: None,
             clear: false,
             listen: "127.0.0.1:0".parse().unwrap(),
+            stats: false,
+            stats_retention: 60,
             verbose: false,
         }
     }
@@ -624,7 +699,7 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let listener = TcpListener::bind(addr).await.unwrap();
-        let resolver = Arc::new(Resolver::new(conn, servers).unwrap());
+        let resolver = Arc::new(Resolver::new(conn, servers, 60).unwrap());
         tokio::spawn(serve(socket, listener, resolver));
         addr
     }
@@ -736,7 +811,7 @@ mod tests {
     #[test]
     fn blocks_listed_domains_and_their_subdomains_only() {
         let resolver =
-            Resolver::new(blocked_db(Path::new(":memory:")), DOH_SERVERS)
+            Resolver::new(blocked_db(Path::new(":memory:")), DOH_SERVERS, 60)
                 .unwrap();
         assert!(resolver.is_blocked("ads.example.com"));
         assert!(resolver.is_blocked("x.y.ads.example.com"));
@@ -747,7 +822,7 @@ mod tests {
     #[test]
     fn stats_writer_persists_in_background() {
         let path = temp_path("stats.db");
-        let sender = spawn_stats_writer(setup_database(&path).unwrap());
+        let sender = spawn_stats_writer(setup_database(&path).unwrap(), 60);
         sender.send(Stat::Winner("Live")).unwrap();
         sender
             .send(Stat::Blocked("ads.example.com".into()))
@@ -762,7 +837,7 @@ mod tests {
         let res = write_stats(&mut conn, std::iter::once(Stat::Winner("A")));
         assert!(res.is_err());
         // El hilo registra el error y sigue vivo.
-        let sender = spawn_stats_writer(conn);
+        let sender = spawn_stats_writer(conn, 60);
         sender.send(Stat::Winner("A")).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         sender.send(Stat::Winner("B")).unwrap();
@@ -770,7 +845,7 @@ mod tests {
 
     #[test]
     fn cache_returns_entry_with_decreasing_ttl() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS).unwrap();
+        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
         resolver.store(key("example.com"), &a_response(300));
         let cached = resolver.cached(&key("example.com")).unwrap();
         let ttl = cached.answers[0].ttl;
@@ -780,7 +855,7 @@ mod tests {
 
     #[test]
     fn cache_skips_errors_zero_ttl_and_empty_answers() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS).unwrap();
+        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
 
         let mut servfail = a_response(300);
         servfail.metadata.response_code = ResponseCode::ServFail;
@@ -793,7 +868,7 @@ mod tests {
 
     #[test]
     fn cache_drops_expired_entries() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS).unwrap();
+        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
         let bytes = a_response(300).to_vec().unwrap();
         resolver
             .cache
@@ -806,7 +881,7 @@ mod tests {
 
     #[test]
     fn cache_evicts_when_full() {
-        let resolver = Resolver::new(memory_db(), DOH_SERVERS).unwrap();
+        let resolver = Resolver::new(memory_db(), DOH_SERVERS, 60).unwrap();
         let msg = a_response(300);
         for i in 0..CACHE_CAPACITY {
             resolver.store(key(&format!("d{i}.com")), &msg);
@@ -947,5 +1022,60 @@ mod tests {
                 .is_none()
         );
         assert!(send_raw(addr, &[0xff]).await.is_none());
+    }
+
+    #[test]
+    fn purge_stats_deletes_only_entries_older_than_retention() {
+        let conn = memory_db();
+        conn.execute_batch(
+            "INSERT INTO fastest_servers (server_name, timestamp)
+                VALUES ('Old', CAST(strftime('%s', 'now', '-61 days') AS INTEGER));
+            INSERT INTO fastest_servers (server_name) VALUES ('New');
+            INSERT INTO blocked_requests (domain, timestamp)
+                VALUES ('old.com', CAST(strftime('%s', 'now', '-61 days') AS INTEGER));
+            INSERT INTO blocked_requests (domain) VALUES ('new.com');",
+        )
+        .unwrap();
+
+        purge_stats(&conn, 60).unwrap();
+
+        assert_eq!(count(&conn, "fastest_servers"), 1);
+        assert_eq!(count(&conn, "blocked_requests"), 1);
+        let name: String = conn
+            .query_row("SELECT server_name FROM fastest_servers", (), |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "New");
+    }
+
+    #[test]
+    fn stats_writer_purges_on_startup() {
+        let path = temp_path("purge.db");
+        let conn = setup_database(&path).unwrap();
+        conn.execute(
+            "INSERT INTO blocked_requests (domain, timestamp) VALUES ('old.com', 0)",
+            (),
+        )
+        .unwrap();
+        let _sender = spawn_stats_writer(conn, 60);
+        wait_count(&path, "blocked_requests", 0);
+    }
+
+    #[test]
+    fn prepare_with_stats_prints_report_and_exits() {
+        let db_path = temp_path("report.db");
+        let conn = setup_database(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO fastest_servers (server_name)
+                VALUES ('Cloudflare'), ('Cloudflare'), ('Google');
+            INSERT INTO blocked_requests (domain) VALUES ('ads.example.com');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut args = args(db_path);
+        args.stats = true;
+        assert!(prepare(&args).unwrap().is_none());
     }
 }
