@@ -8,13 +8,15 @@
     <array>
         <string>/usr/local/bin/doh</string>
         <string>--db-path</string>
-        <string>/usr/local/var/doh/doh_blocklist.db</string>
+        <string>/var/db/doh/doh_blocklist.db</string>
+        <string>--user</string>
+        <string>nobody</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/doh.log</string>
+    <string>/var/log/doh.log</string>
 </dict>
 </plist>

@@ -50,6 +50,11 @@ struct Args {
     #[arg(short, long, default_value = "127.0.0.1:53")]
     listen: SocketAddr,
 
+    /// Switch to this user after opening the listening sockets, before
+    /// touching the database (requires starting as root).
+    #[arg(short, long, value_name = "USER")]
+    user: Option<String>,
+
     /// DoH servers to race, comma separated: google, cloudflare, quad9,
     /// opendns or NAME=URL (https only). Defaults to all the built-in ones.
     #[arg(
@@ -797,15 +802,53 @@ fn prepare(args: &Args) -> Result<Option<Connection>, BoxError> {
     Ok(Some(conn))
 }
 
+fn drop_privileges(user: &str) -> Result<(), BoxError> {
+    let name = std::ffi::CString::new(user)?;
+    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+    if entry.is_null() {
+        return Err(format!("unknown user {user}").into());
+    }
+    let (uid, gid) = unsafe { ((*entry).pw_uid, (*entry).pw_gid) };
+    let failed = unsafe {
+        libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(gid) != 0
+            || libc::setuid(uid) != 0
+    };
+    if failed {
+        return Err(format!(
+            "cannot switch to user {user}: {}",
+            io::Error::last_os_error()
+        )
+        .into());
+    }
+    if uid != 0 && unsafe { libc::setuid(0) } == 0 {
+        return Err("privileges could be regained after switching user".into());
+    }
+    Ok(())
+}
+
 async fn run(argv: Vec<OsString>) -> Result<(), BoxError> {
     let args = with_config(Args::parse_from(&argv), &argv)?;
     VERBOSE.store(args.verbose, Ordering::Relaxed);
+    let serving = !args.clear && !args.stats && args.blocklist.is_none();
+    let sockets = if serving {
+        Some((
+            UdpSocket::bind(args.listen).await?,
+            TcpListener::bind(args.listen).await?,
+        ))
+    } else {
+        None
+    };
+    if let Some(user) = &args.user {
+        drop_privileges(user)?;
+    }
     let Some(conn) = prepare(&args)? else {
         return Ok(());
     };
+    let Some((socket, listener)) = sockets else {
+        return Ok(());
+    };
     let resolver = Resolver::new(conn, &args)?;
-    let socket = UdpSocket::bind(args.listen).await?;
-    let listener = TcpListener::bind(args.listen).await?;
     println!("DNS server listening on {}", args.listen);
     serve(socket, listener, Arc::new(resolver)).await;
     Ok(())
@@ -853,6 +896,7 @@ mod tests {
             blocklist: None,
             clear: false,
             listen: "127.0.0.1:0".parse().unwrap(),
+            user: None,
             config: None,
             servers: vec![],
             upstream_timeout: 5,
@@ -1869,5 +1913,20 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("stats table was never trimmed");
+    }
+
+    #[tokio::test]
+    async fn run_fails_before_touching_the_database_for_an_unknown_user() {
+        let db = temp_path("unknown-user.db");
+        let res = run(argv(&[
+            "-d",
+            db.to_str().unwrap(),
+            "--stats",
+            "--user",
+            "doh-no-such-user",
+        ]))
+        .await;
+        assert!(res.unwrap_err().to_string().contains("unknown user"));
+        assert!(!db.exists());
     }
 }

@@ -105,7 +105,8 @@ cargo run -- --stats-retention 30
 `contrib/` contains service files for Linux (systemd) and macOS (launchd). Both expect the binary at `/usr/local/bin/doh`:
 
 ```sh
-cargo build --release && sudo cp target/release/doh /usr/local/bin/
+cargo build --release
+sudo install -o root -m 755 target/release/doh /usr/local/bin/doh
 ```
 
 Linux (runs without root thanks to `CAP_NET_BIND_SERVICE`; the database lives in `/var/lib/doh`):
@@ -115,15 +116,25 @@ sudo cp contrib/doh.service /etc/systemd/system/
 sudo systemctl enable --now doh
 ```
 
-macOS (the database lives in `/usr/local/var/doh` and errors go to `/usr/local/var/log/doh.log`):
+macOS (starts as root only to open port 53, then runs as `nobody` thanks to `--user`; the database lives in `/var/db/doh` and errors go to `/var/log/doh.log`, both root-owned locations):
 
 ```sh
-sudo mkdir -p /usr/local/var/doh /usr/local/var/log
+sudo install -d -o nobody -m 700 /var/db/doh
 sudo cp contrib/local.doh.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/local.doh.plist
 ```
 
-The blocklist is loaded when the service starts, so restart it after importing a new list into its database with `--db-path`.
+The blocklist is loaded when the service starts. To import a new list into the service database and restart it:
+
+```sh
+# Linux (systemd keeps DynamicUser state under /var/lib/private)
+sudo doh --db-path /var/lib/private/doh/doh_blocklist.db --blocklist list.txt
+sudo systemctl restart doh
+
+# macOS
+sudo doh --db-path /var/db/doh/doh_blocklist.db --user nobody --blocklist list.txt
+sudo launchctl kickstart -k system/local.doh
+```
 
 
 ## Benchmark

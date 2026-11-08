@@ -276,6 +276,7 @@ dependencies = [
  "clap",
  "futures",
  "hickory-proto",
+ "libc",
  "reqwest",
  "rusqlite",
  "tokio",
