@@ -61,6 +61,8 @@ Resource limits, all configurable:
 | `--max-ttl` | 86,400 s | How long an answer stays cached |
 | `--stats-max-rows` | 1,000,000 | Rows kept per statistics table |
 
+If doh sits behind a router or another DNS forwarder, every query arrives from that one IP, so raise `--max-upstream-per-client` (for example to the `--max-upstream-queries` value).
+
 Run `cargo run -- --help` to see every option.
 
 
@@ -157,14 +159,16 @@ Compared with two popular open source ad-blocking DNS proxies, using the same fo
 
 | | doh | Blocky v0.35.0 | AdGuard Home v0.107.80 |
 |---|---|---|---|
-| Cached queries | **112,583 qps** | 89,032 qps | 89,956 qps |
-| Blocked queries | 84,730 qps | 89,925 qps | **90,561 qps** |
-| Uncached latency p50 | 9.1 ms | 14.3 ms | **6.5 ms** |
-| Uncached latency p95 | **44.4 ms** | 137.6 ms | 86.8 ms |
-| Uncached latency p99 | **116.0 ms** | 327.2 ms | 216.8 ms |
-| Memory at startup | **34.8 MB** | 52.9 MB | 78.5 MB |
-| Memory after the run | **43.6 MB** | 77.6 MB | 113.0 MB |
-| Binary size | **4.7 MB** | 32.3 MB | 33.1 MB |
+| Cached queries | **105,746 qps** ¹ | 88,815 qps | 90,738 qps |
+| Blocked queries | 86,256 qps | 90,213 qps | **90,830 qps** |
+| Uncached latency p50 | 9.5 ms | 13.6 ms | **7.8 ms** |
+| Uncached latency p95 | **47.3 ms** | 101.6 ms | 89.0 ms |
+| Uncached latency p99 | **145.4 ms** | 328.7 ms | 226.5 ms |
+| Memory at startup | **30.5 MB** | 53.5 MB | 79.1 MB |
+| Memory after the run | **39.6 MB** | 84.5 MB | 112.8 MB |
+| Binary size | **4.8 MB** | 32.3 MB | 33.1 MB |
+
+¹ doh dropped about 0.05% of the cached-test queries (336 per round). A few of the 100 test domains return answers that cannot be cached (TTL 0 or no records), so they go upstream on every query; since all `dnsperf` traffic comes from one IP, misses beyond `--max-upstream-per-client` (32) are dropped by design. Blocky and AdGuard Home lost none.
 
 How it was measured:
 
@@ -183,6 +187,14 @@ bench/bench.sh doh 5300 <PID>
 ```
 
 The query lists in `bench/` come from the [Tranco](https://tranco-list.eu) top sites list and the AdguardDNS blocklist.
+
+
+## How it was built
+
+This project was developed with the help of two open source agent skills:
+
+- [ponytail](https://github.com/DietrichGebert/ponytail) by Dietrich Gebert: keeps the code lean (YAGNI, standard library first, no unneeded abstractions). Its repository-wide audit was used to remove over-engineering, such as duplicated test servers and redundant cache limits.
+- [security-audit-skill](https://github.com/cloudflare/security-audit-skill) by Cloudflare: multi-phase security audits with independently verified findings. Two runs drove the hardening in this repository: HTTPS-only upstreams, reply validation, name filtering, resource limits, CNAME inspection, privilege dropping and ignoring DNS responses. The second, full audit ran its local checks in an isolated Linux sandbox.
 
 
 ## Notes
