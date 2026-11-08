@@ -1,6 +1,6 @@
 use clap::Parser;
 use futures::future::select_ok;
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::op::{Message, OpCode, Query};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use reqwest::Client;
@@ -53,11 +53,9 @@ async fn doh_req(
     domain: &str,
     record_type: RecordType,
 ) -> Result<(Message, &'static str), BoxError> {
-    let mut msg = Message::new();
+    let mut msg = Message::query();
     msg.add_query(Query::query(Name::from_ascii(domain)?, record_type));
-    msg.set_recursion_desired(true);
-    msg.set_message_type(MessageType::Query);
-    msg.set_op_code(OpCode::Query);
+    msg.metadata.recursion_desired = true;
 
     let response = client
         .post(url)
@@ -154,7 +152,7 @@ async fn handle_request(
     servers: Servers,
 ) -> Result<(), BoxError> {
     let request = Message::from_bytes(&data)?;
-    let Some(query) = request.queries().first() else {
+    let Some(query) = request.queries.first() else {
         return Ok(());
     };
 
@@ -183,12 +181,9 @@ async fn handle_request(
             eprintln!("Error saving blocked request: {}", e);
         }
 
-        let mut response = Message::new();
-        response.set_recursion_desired(true);
-        response.set_op_code(OpCode::Query);
-        response.set_message_type(MessageType::Response);
+        let mut response = Message::response(request.id, OpCode::Query);
+        response.metadata.recursion_desired = true;
         response.add_query(query.clone());
-        response.set_response_code(ResponseCode::NoError);
 
         let rdata = match qtype {
             RecordType::A => Some(RData::A(Ipv4Addr::UNSPECIFIED.into())),
@@ -215,7 +210,7 @@ async fn handle_request(
         }
     };
 
-    response.set_id(request.id());
+    response.metadata.id = request.id;
     socket.send_to(&response.to_vec()?, src).await?;
     Ok(())
 }
@@ -278,6 +273,7 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::{MessageType, ResponseCode};
     use std::io::Cursor;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -350,8 +346,8 @@ mod tests {
 
                     let mut res =
                         Message::from_bytes(&buf[start..start + len]).unwrap();
-                    res.set_message_type(MessageType::Response);
-                    let name = res.queries()[0].name().clone();
+                    res.metadata.message_type = MessageType::Response;
+                    let name = res.queries[0].name().clone();
                     res.add_answer(Record::from_rdata(
                         name,
                         60,
@@ -394,8 +390,8 @@ mod tests {
         domain: &str,
         qtype: RecordType,
     ) -> Option<Message> {
-        let mut msg = Message::new();
-        msg.set_id(4242);
+        let mut msg = Message::query();
+        msg.metadata.id = 4242;
         msg.add_query(Query::query(Name::from_ascii(domain).unwrap(), qtype));
         send_raw(addr, &msg.to_vec().unwrap()).await
     }
@@ -475,8 +471,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            res.answers()[0].data(),
-            &RData::A(Ipv4Addr::new(1, 2, 3, 4).into())
+            res.answers[0].data,
+            RData::A(Ipv4Addr::new(1, 2, 3, 4).into())
         );
         let winner: String = db
             .lock()
@@ -530,25 +526,22 @@ mod tests {
         .await;
 
         let a = ask(addr, "ads.example.com.", RecordType::A).await.unwrap();
-        assert_eq!(a.id(), 4242);
-        assert_eq!(a.message_type(), MessageType::Response);
-        assert_eq!(
-            a.answers()[0].data(),
-            &RData::A(Ipv4Addr::UNSPECIFIED.into())
-        );
+        assert_eq!(a.id, 4242);
+        assert_eq!(a.message_type, MessageType::Response);
+        assert_eq!(a.answers[0].data, RData::A(Ipv4Addr::UNSPECIFIED.into()));
 
         let aaaa = ask(addr, "ads.example.com.", RecordType::AAAA)
             .await
             .unwrap();
         assert_eq!(
-            aaaa.answers()[0].data(),
-            &RData::AAAA(Ipv6Addr::UNSPECIFIED.into())
+            aaaa.answers[0].data,
+            RData::AAAA(Ipv6Addr::UNSPECIFIED.into())
         );
 
         // Tipos distintos de A/AAAA reciben respuesta vacía en vez de timeout.
         let mx = ask(addr, "ads.example.com.", RecordType::MX).await.unwrap();
-        assert_eq!(mx.response_code(), ResponseCode::NoError);
-        assert!(mx.answers().is_empty());
+        assert_eq!(mx.response_code, ResponseCode::NoError);
+        assert!(mx.answers.is_empty());
 
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocked_requests"), 3);
@@ -564,7 +557,7 @@ mod tests {
         .unwrap();
         let addr = start(conn, leak_servers(vec![("Dead", dead_url())])).await;
         let res = ask(addr, "ads.example.com.", RecordType::A).await.unwrap();
-        assert_eq!(res.answers().len(), 1);
+        assert_eq!(res.answers.len(), 1);
     }
 
     #[tokio::test]
@@ -577,10 +570,10 @@ mod tests {
         .await;
 
         let res = ask(addr, "good.example.com.", RecordType::A).await.unwrap();
-        assert_eq!(res.id(), 4242);
+        assert_eq!(res.id, 4242);
         assert_eq!(
-            res.answers()[0].data(),
-            &RData::A(Ipv4Addr::new(9, 9, 9, 9).into())
+            res.answers[0].data,
+            RData::A(Ipv4Addr::new(9, 9, 9, 9).into())
         );
     }
 
@@ -598,7 +591,7 @@ mod tests {
                 .is_none()
         );
         assert!(
-            send_raw(addr, &Message::new().to_vec().unwrap())
+            send_raw(addr, &Message::query().to_vec().unwrap())
                 .await
                 .is_none()
         );
