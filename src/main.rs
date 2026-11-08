@@ -184,15 +184,19 @@ async fn handle_request(
         response.set_response_code(ResponseCode::NoError);
 
         let rdata = match qtype {
-            RecordType::A => RData::A(Ipv4Addr::UNSPECIFIED.into()),
-            RecordType::AAAA => RData::AAAA(Ipv6Addr::UNSPECIFIED.into()),
-            _ => return Ok(()),
+            RecordType::A => Some(RData::A(Ipv4Addr::UNSPECIFIED.into())),
+            RecordType::AAAA => {
+                Some(RData::AAAA(Ipv6Addr::UNSPECIFIED.into()))
+            }
+            _ => None,
         };
-        response.add_answer(Record::from_rdata(
-            query.name().clone(),
-            0,
-            rdata,
-        ));
+        if let Some(rdata) = rdata {
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                0,
+                rdata,
+            ));
+        }
         response
     } else {
         match doh_race(&client, &qname, qtype, &db).await {
