@@ -981,7 +981,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Espera a que el hilo de estadísticas escriba `expected` filas.
+    /// Waits until the stats writer thread has written `expected` rows.
     fn wait_count(path: &Path, table: &str, expected: i64) {
         for _ in 0..100 {
             if count(&Connection::open(path).unwrap(), table) == expected {
@@ -992,7 +992,7 @@ mod tests {
         panic!("{table} never reached {expected} rows");
     }
 
-    /// URL de un puerto TCP cerrado: cualquier request falla con conexión rechazada.
+    /// URL of a closed TCP port: every request fails with connection refused.
     fn dead_url() -> &'static str {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url =
@@ -1000,8 +1000,8 @@ mod tests {
         Box::leak(url.into_boxed_str())
     }
 
-    /// Servidor HTTP mínimo: lee cada petición completa, cuenta cuántas
-    /// recibió y responde los bytes que devuelve `reply` para su cuerpo.
+    /// Minimal HTTP server: reads each full request, counts how many it got
+    /// and answers with the bytes `reply` returns for the request body.
     async fn mock_http(
         reply: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
     ) -> (&'static str, Arc<AtomicUsize>) {
@@ -1049,7 +1049,7 @@ mod tests {
         (Box::leak(url.into_boxed_str()), hits)
     }
 
-    /// Respuesta DoH 200 a la query recibida, con los registros de `answer`.
+    /// DoH 200 response to the received query, with the records from `answer`.
     fn doh_reply(
         query: &[u8],
         answer: impl Fn(&Name) -> Vec<RData>,
@@ -1063,7 +1063,7 @@ mod tests {
         http_response("200 OK", "", &res.to_vec().unwrap())
     }
 
-    /// Servidor DoH que responde `records` registros A fijos (TTL 60).
+    /// DoH server that answers with `records` fixed A records (TTL 60).
     async fn mock_doh(
         answer: Ipv4Addr,
         records: usize,
@@ -1220,7 +1220,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         let res = write_stats(&mut conn, std::iter::once(Stat::Winner("A")));
         assert!(res.is_err());
-        // El hilo registra el error y sigue vivo.
+        // The thread logs the error and keeps running.
         let sender = spawn_stats_writer(conn, 60, 1_000);
         sender.send(Stat::Winner("A")).unwrap();
         std::thread::sleep(Duration::from_millis(50));
@@ -1354,7 +1354,7 @@ mod tests {
             RData::AAAA(Ipv6Addr::UNSPECIFIED.into())
         );
 
-        // Tipos distintos de A/AAAA reciben respuesta vacía en vez de timeout.
+        // Types other than A/AAAA get an empty answer instead of a timeout.
         let mx = ask(addr, "ads.example.com.", RecordType::MX).await.unwrap();
         assert_eq!(mx.response_code, ResponseCode::NoError);
         assert!(mx.answers.is_empty());
@@ -1383,7 +1383,7 @@ mod tests {
                 RData::A(Ipv4Addr::new(9, 9, 9, 9).into())
             );
         }
-        // La pregunta se devuelve tal como la escribió el cliente.
+        // The question is returned exactly as the client wrote it.
         assert_eq!(second.queries[0].name().to_utf8(), "GOOD.example.com.");
         wait_count(&db_path, "fastest_servers", 1);
     }
@@ -1621,9 +1621,9 @@ mod tests {
         )
         .await;
 
-        // Un byte '.' dentro del último label se escapaba como "\." y el
-        // trim del punto final dejaba "ads.example.com\", que no matcheaba
-        // la blocklist pero se reenviaba como ads.example.com.
+        // A '.' byte inside the last label was escaped as "\." and trimming
+        // the trailing dot left "ads.example.com\", which missed the blocklist
+        // but was forwarded as ads.example.com.
         let variants: [&[&[u8]]; 2] = [
             &[b"ads", b"example", b"com."],
             &[b"ads", b"example", b"com", b"."],
@@ -1649,8 +1649,8 @@ mod tests {
         )
         .await;
 
-        // Label punycode con ESC en sus code points básicos, bajo un dominio
-        // bloqueado; luego una consulta normal que marca el final.
+        // Punycode label with ESC among its basic code points under a blocked
+        // domain, followed by a normal query that marks the end.
         let evil: &[&[u8]] =
             &[b"xn--\x1b[2K\x1b[1A\x1b[2K-olb", b"ads", b"example", b"com"];
         send_raw(addr, &raw_query(evil, RecordType::A)).await;
@@ -1695,7 +1695,7 @@ mod tests {
             query_domain(&name(&[b"_dmarc", b"my-site", b"org"])).as_deref(),
             Some("_dmarc.my-site.org")
         );
-        // Los IDN se mantienen en punycode en vez de decodificarse.
+        // IDNs stay in punycode instead of being decoded.
         assert_eq!(
             query_domain(&name(&[b"xn--bcher-kva", b"example"])).as_deref(),
             Some("xn--bcher-kva.example")
@@ -1711,7 +1711,7 @@ mod tests {
         }
     }
 
-    /// Servidor HTTP que responde siempre los mismos bytes crudos.
+    /// HTTP server that always answers with the same raw bytes.
     async fn mock_raw(response: Vec<u8>) -> &'static str {
         mock_http(move |_| response.clone()).await.0
     }
@@ -1810,7 +1810,7 @@ mod tests {
         assert_eq!(held.answers.len(), 1);
         let first = TcpStream::connect(addr).await.unwrap();
         let mut rejected = TcpStream::connect(addr).await.unwrap();
-        // La segunda conexión simultánea se cierra sin respuesta.
+        // The second simultaneous connection is closed without an answer.
         let query = query_bytes("ads.example.com.", RecordType::A);
         let _ = rejected.write_u16(query.len() as u16).await;
         let _ = rejected.write_all(&query).await;
@@ -1841,7 +1841,7 @@ mod tests {
                 .await
                 .is_none()
         );
-        // Bloqueados y cacheados no necesitan cupo upstream.
+        // Blocked and cached names do not need an upstream slot.
         assert!(
             limited
                 .resolve(&request("ads.example.com."), LOCAL)
@@ -1860,7 +1860,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
-    /// Servidor DoH que responde cada query con un CNAME hacia `target`.
+    /// DoH server that answers every query with a CNAME to `target`.
     async fn mock_cname(target: &'static str) -> &'static str {
         mock_http(move |q| {
             doh_reply(q, |_| {
@@ -1891,8 +1891,8 @@ mod tests {
         );
         wait_count(&db_path, "blocked_requests", 1);
 
-        // Un destino con bytes fuera de LDH no puede esconder al padre
-        // bloqueado: se trata como bloqueado.
+        // A target with non-LDH bytes cannot hide its blocked parent: it is
+        // treated as blocked.
         let db_odd = temp_path("cname-odd.db");
         let odd = mock_cname("a\\.b.ads.example.com.").await;
         let addr =
@@ -1980,8 +1980,8 @@ mod tests {
         .unwrap();
         assert!(resolver.resolve(&query, LOCAL).await.is_some());
 
-        // Una respuesta (QR=1) contestada formaba un bucle infinito entre dos
-        // resolvers con un solo datagrama de origen falsificado.
+        // Answering a response (QR=1) created an endless loop between two
+        // resolvers from a single spoofed datagram.
         let mut response = query.clone();
         response.metadata.message_type = MessageType::Response;
         assert!(resolver.resolve(&response, LOCAL).await.is_none());
@@ -2005,7 +2005,7 @@ mod tests {
         };
         let (a, b) = (LOCAL, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
 
-        // El cliente A ya tiene una consulta en curso hacia upstream.
+        // Client A already has a lookup in flight to the upstream.
         let busy = limited.client_lookup(a).unwrap();
         assert!(
             limited
