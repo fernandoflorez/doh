@@ -56,6 +56,7 @@ Resource limits, all configurable:
 |---|---|---|
 | `--max-tcp-connections` | 256 | Simultaneous TCP clients |
 | `--max-upstream-queries` | 256 | Cache misses waiting on DoH servers |
+| `--max-upstream-per-client` | 32 | Cache misses one client IP can have waiting |
 | `--cache-max-mb` | 32 MB | Memory used by cached answers |
 | `--max-ttl` | 86,400 s | How long an answer stays cached |
 | `--stats-max-rows` | 1,000,000 | Rows kept per statistics table |

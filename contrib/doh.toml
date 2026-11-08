@@ -11,6 +11,7 @@
 
 # upstream_timeout = 5          # seconds
 # max_upstream_queries = 256    # cache misses in flight
+# max_upstream_per_client = 32  # cache misses in flight per client IP
 # cache_max_mb = 32             # megabytes
 # max_ttl = 86400               # seconds
 # blocked_ttl = 60              # seconds

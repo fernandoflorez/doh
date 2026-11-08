@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,6 +74,11 @@ struct Args {
     /// further cache misses are dropped until one finishes.
     #[arg(long, value_name = "QUERIES", default_value_t = 256)]
     max_upstream_queries: usize,
+
+    /// Maximum queries from one client IP waiting on DoH servers at the same
+    /// time, so a single client cannot take every upstream slot.
+    #[arg(long, value_name = "QUERIES", default_value_t = 32)]
+    max_upstream_per_client: usize,
 
     /// Maximum memory used by cached responses, in megabytes.
     #[arg(long, value_name = "MB", default_value_t = 32)]
@@ -168,6 +173,29 @@ struct Resolver {
     tcp_timeout: Duration,
     max_tcp_connections: usize,
     upstream_slots: Semaphore,
+    max_upstream_per_client: usize,
+    client_lookups: Mutex<HashMap<IpAddr, usize>>,
+}
+
+struct ClientLookup<'a> {
+    resolver: &'a Resolver,
+    client: IpAddr,
+}
+
+impl Drop for ClientLookup<'_> {
+    fn drop(&mut self) {
+        let mut lookups = self
+            .resolver
+            .client_lookups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = lookups.get_mut(&self.client) {
+            *count -= 1;
+            if *count == 0 {
+                lookups.remove(&self.client);
+            }
+        }
+    }
 }
 
 fn parse_server(value: &str) -> Result<(&'static str, &'static str), String> {
@@ -508,6 +536,8 @@ impl Resolver {
             tcp_timeout: Duration::from_secs(args.tcp_timeout),
             max_tcp_connections: args.max_tcp_connections,
             upstream_slots: Semaphore::new(args.max_upstream_queries),
+            max_upstream_per_client: args.max_upstream_per_client,
+            client_lookups: Mutex::default(),
         })
     }
 
@@ -530,6 +560,22 @@ impl Resolver {
                 query_domain(&target.0).is_none_or(|d| self.is_blocked(&d))
             }
             _ => false,
+        })
+    }
+
+    fn client_lookup(&self, client: IpAddr) -> Option<ClientLookup<'_>> {
+        let mut lookups = self
+            .client_lookups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = lookups.entry(client).or_insert(0);
+        if *count >= self.max_upstream_per_client {
+            return None;
+        }
+        *count += 1;
+        Some(ClientLookup {
+            resolver: self,
+            client,
         })
     }
 
@@ -618,7 +664,11 @@ impl Resolver {
             .insert(key, (bytes, now + Duration::from_secs(ttl.into())));
     }
 
-    async fn resolve(&self, request: &Message) -> Option<Message> {
+    async fn resolve(
+        &self,
+        request: &Message,
+        client: IpAddr,
+    ) -> Option<Message> {
         if request.message_type != MessageType::Query
             || request.op_code != OpCode::Query
         {
@@ -643,6 +693,10 @@ impl Resolver {
                 vlog!("Cache hit: {}", key.0);
                 cached
             } else {
+                let Some(_lookup) = self.client_lookup(client) else {
+                    vlog!("Per-client upstream limit reached for {}", client);
+                    return None;
+                };
                 let Ok(_slot) = self.upstream_slots.try_acquire() else {
                     vlog!("Upstream query limit reached, dropping {}", key.0);
                     return None;
@@ -705,7 +759,8 @@ async fn serve_udp(socket: UdpSocket, resolver: Arc<Resolver>) {
                 vlog!("Malformed UDP request from {}", src);
                 return;
             };
-            let Some(response) = resolver.resolve(&request).await else {
+            let Some(response) = resolver.resolve(&request, src.ip()).await
+            else {
                 return;
             };
             match udp_bytes(&request, &response) {
@@ -722,6 +777,7 @@ async fn serve_udp(socket: UdpSocket, resolver: Arc<Resolver>) {
 
 async fn handle_tcp(
     mut stream: TcpStream,
+    client: IpAddr,
     resolver: &Resolver,
 ) -> Result<(), BoxError> {
     while let Ok(Ok(len)) =
@@ -730,7 +786,7 @@ async fn handle_tcp(
         let mut data = vec![0; len.into()];
         timeout(resolver.tcp_timeout, stream.read_exact(&mut data)).await??;
         let request = Message::from_bytes(&data)?;
-        let Some(response) = resolver.resolve(&request).await else {
+        let Some(response) = resolver.resolve(&request, client).await else {
             return Ok(());
         };
         let bytes = response.to_vec()?;
@@ -747,8 +803,8 @@ async fn handle_tcp(
 async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
     let slots = Arc::new(Semaphore::new(resolver.max_tcp_connections));
     loop {
-        let stream = match listener.accept().await {
-            Ok((stream, _)) => stream,
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
             Err(e) => {
                 vlog!("Error accepting TCP connection: {}", e);
                 sleep(Duration::from_millis(100)).await;
@@ -762,7 +818,7 @@ async fn serve_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
         let resolver = Arc::clone(&resolver);
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = handle_tcp(stream, &resolver).await {
+            if let Err(e) = handle_tcp(stream, peer.ip(), &resolver).await {
                 vlog!("Error handling TCP connection: {}", e);
             }
         });
@@ -861,6 +917,8 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
 
@@ -902,6 +960,7 @@ mod tests {
             tcp_timeout: 10,
             max_tcp_connections: 256,
             max_upstream_queries: 256,
+            max_upstream_per_client: 32,
             stats: false,
             stats_retention: 60,
             stats_max_rows: 1_000_000,
@@ -1778,14 +1837,14 @@ mod tests {
         let busy = limited.upstream_slots.try_acquire().unwrap();
         assert!(
             limited
-                .resolve(&request("good.example.com."))
+                .resolve(&request("good.example.com."), LOCAL)
                 .await
                 .is_none()
         );
         // Bloqueados y cacheados no necesitan cupo upstream.
         assert!(
             limited
-                .resolve(&request("ads.example.com."))
+                .resolve(&request("ads.example.com."), LOCAL)
                 .await
                 .is_some()
         );
@@ -1794,7 +1853,7 @@ mod tests {
         drop(busy);
         assert!(
             limited
-                .resolve(&request("good.example.com."))
+                .resolve(&request("good.example.com."), LOCAL)
                 .await
                 .is_some()
         );
@@ -1919,19 +1978,57 @@ mod tests {
             RecordType::A,
         ))
         .unwrap();
-        assert!(resolver.resolve(&query).await.is_some());
+        assert!(resolver.resolve(&query, LOCAL).await.is_some());
 
         // Una respuesta (QR=1) contestada formaba un bucle infinito entre dos
         // resolvers con un solo datagrama de origen falsificado.
         let mut response = query.clone();
         response.metadata.message_type = MessageType::Response;
-        assert!(resolver.resolve(&response).await.is_none());
+        assert!(resolver.resolve(&response, LOCAL).await.is_none());
 
         let mut notify = query.clone();
         notify.metadata.op_code = OpCode::Notify;
-        assert!(resolver.resolve(&notify).await.is_none());
+        assert!(resolver.resolve(&notify, LOCAL).await.is_none());
 
         let addr = start(blocked_db(Path::new(":memory:")), DOH_SERVERS).await;
         assert!(send_raw(addr, &response.to_vec().unwrap()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_client_cannot_take_every_upstream_slot() {
+        let (live, hits) = mock_doh(Ipv4Addr::new(1, 2, 3, 4), 1).await;
+        let mut limited =
+            resolver(memory_db(), leak_servers(vec![("Live", live)]));
+        limited.max_upstream_per_client = 1;
+        let request = |name: &str| {
+            Message::from_bytes(&query_bytes(name, RecordType::A)).unwrap()
+        };
+        let (a, b) = (LOCAL, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+
+        // El cliente A ya tiene una consulta en curso hacia upstream.
+        let busy = limited.client_lookup(a).unwrap();
+        assert!(
+            limited
+                .resolve(&request("one.example.com."), a)
+                .await
+                .is_none()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(
+            limited
+                .resolve(&request("two.example.com."), b)
+                .await
+                .is_some()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        drop(busy);
+        assert!(limited.client_lookups.lock().unwrap().is_empty());
+        assert!(
+            limited
+                .resolve(&request("one.example.com."), a)
+                .await
+                .is_some()
+        );
     }
 }
