@@ -16,6 +16,11 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
     <key>StandardErrorPath</key>
     <string>/var/log/doh.log</string>
 </dict>
