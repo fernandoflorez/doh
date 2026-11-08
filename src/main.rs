@@ -30,6 +30,10 @@ struct Args {
     /// Clear all domains from the blocklist database.
     #[arg(long)]
     clear: bool,
+
+    /// Address and port to listen on for DNS queries.
+    #[arg(short, long, default_value = "127.0.0.1:53")]
+    listen: SocketAddr,
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -264,10 +268,11 @@ async fn serve(
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let Some(conn) = prepare(&Args::parse())? else {
+    let args = Args::parse();
+    let Some(conn) = prepare(&args)? else {
         return Ok(());
     };
-    serve(UdpSocket::bind("127.0.0.1:53").await?, conn, DOH_SERVERS).await
+    serve(UdpSocket::bind(args.listen).await?, conn, DOH_SERVERS).await
 }
 
 #[cfg(test)]
@@ -429,6 +434,7 @@ mod tests {
             db_path: db_path.clone(),
             blocklist: Some(list_path),
             clear: false,
+            listen: "127.0.0.1:0".parse().unwrap(),
         };
         let conn = prepare(&args).unwrap().unwrap();
         assert_eq!(count(&conn, "blocklist"), 2);
@@ -447,6 +453,7 @@ mod tests {
             db_path: PathBuf::from(":memory:"),
             blocklist: Some(temp_path("missing.txt")),
             clear: false,
+            listen: "127.0.0.1:0".parse().unwrap(),
         };
         assert!(prepare(&args).is_err());
     }

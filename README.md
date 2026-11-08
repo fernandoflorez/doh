@@ -30,7 +30,13 @@ Para eliminar los registros:
 Los hostnames se almacenan en sqlite. Por defecto el nombre es 'doh_blocklist.db' pero puede cambiarse con --db-path.
 
 
-**Es necesario ejecutarlo con sudo porque requiere usar el puerto 53 para funcionar correctamente.**
+Por defecto escucha en `127.0.0.1:53`, que es el puerto que usa la configuración DNS del sistema. Para usar el puerto 53 hace falta ejecutarlo con sudo (en Linux se puede evitar con `sudo setcap cap_net_bind_service=+ep target/release/doh`).
+
+Para escuchar en otra dirección o puerto se usa --listen:
+
+```cargo run -- --listen 127.0.0.1:5300```
+
+```dig @127.0.0.1 -p 5300 example.com```
 
 
 Ideas para después:
