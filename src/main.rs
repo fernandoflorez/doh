@@ -103,6 +103,10 @@ struct Args {
     #[arg(long, value_name = "DAYS", default_value_t = 60)]
     stats_retention: u32,
 
+    /// Maximum rows kept in each statistics table; the oldest are deleted.
+    #[arg(long, value_name = "ROWS", default_value_t = 1_000_000)]
+    stats_max_rows: u64,
+
     /// Log every query, cache hit, blocked domain and winning server.
     #[arg(short, long)]
     verbose: bool,
@@ -362,15 +366,20 @@ fn write_stats(
     transaction.commit()
 }
 
-fn purge_stats(conn: &Connection, retention_days: u32) -> Result<()> {
+fn purge_stats(
+    conn: &Connection,
+    retention_days: u32,
+    max_rows: u64,
+) -> Result<()> {
     let cutoff = format!("-{retention_days} days");
     for table in ["fastest_servers", "blocked_requests"] {
         conn.execute(
             &format!(
                 "DELETE FROM {table}
-                WHERE timestamp < CAST(strftime('%s', 'now', ?1) AS INTEGER)"
+                WHERE timestamp < CAST(strftime('%s', 'now', ?1) AS INTEGER)
+                OR id <= (SELECT MAX(id) FROM {table}) - ?2"
             ),
-            params![cutoff],
+            params![cutoff, i64::try_from(max_rows).unwrap_or(i64::MAX)],
         )?;
     }
     Ok(())
@@ -379,24 +388,32 @@ fn purge_stats(conn: &Connection, retention_days: u32) -> Result<()> {
 fn spawn_stats_writer(
     mut conn: Connection,
     retention_days: u32,
+    max_rows: u64,
 ) -> SyncSender<Stat> {
     let (sender, receiver) = sync_channel(STATS_QUEUE);
+    let purge_after_rows = (max_rows / 10).max(1);
     std::thread::spawn(move || {
         let mut last_purge: Option<Instant> = None;
+        let mut written: u64 = 0;
         loop {
-            if last_purge.is_none_or(|t| t.elapsed() >= PURGE_EVERY) {
-                if let Err(e) = purge_stats(&conn, retention_days) {
+            if written >= purge_after_rows
+                || last_purge.is_none_or(|t| t.elapsed() >= PURGE_EVERY)
+            {
+                if let Err(e) = purge_stats(&conn, retention_days, max_rows) {
                     eprintln!("Error purging stats: {}", e);
                 }
                 last_purge = Some(Instant::now());
+                written = 0;
             }
             let first = match receiver.recv_timeout(PURGE_EVERY) {
                 Ok(stat) => stat,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => return,
             };
-            let batch = std::iter::once(first).chain(receiver.try_iter());
-            if let Err(e) = write_stats(&mut conn, batch) {
+            let batch: Vec<Stat> =
+                std::iter::once(first).chain(receiver.try_iter()).collect();
+            written += batch.len() as u64;
+            if let Err(e) = write_stats(&mut conn, batch.into_iter()) {
                 eprintln!("Error saving stats: {}", e);
             }
         }
@@ -476,7 +493,11 @@ impl Resolver {
             servers: select_servers(&args.servers),
             blocklist,
             cache: Mutex::default(),
-            stats: spawn_stats_writer(conn, args.stats_retention),
+            stats: spawn_stats_writer(
+                conn,
+                args.stats_retention,
+                args.stats_max_rows,
+            ),
             cache_size: args.cache_size,
             cache_max_bytes: args.cache_max_mb.saturating_mul(1024 * 1024),
             max_ttl: args.max_ttl,
@@ -843,6 +864,7 @@ mod tests {
             max_upstream_queries: 256,
             stats: false,
             stats_retention: 60,
+            stats_max_rows: 1_000_000,
             verbose: false,
         }
     }
@@ -1076,7 +1098,8 @@ mod tests {
     #[test]
     fn stats_writer_persists_in_background() {
         let path = temp_path("stats.db");
-        let sender = spawn_stats_writer(setup_database(&path).unwrap(), 60);
+        let sender =
+            spawn_stats_writer(setup_database(&path).unwrap(), 60, 1_000);
         sender.send(Stat::Winner("Live")).unwrap();
         sender
             .send(Stat::Blocked("ads.example.com".into()))
@@ -1091,7 +1114,7 @@ mod tests {
         let res = write_stats(&mut conn, std::iter::once(Stat::Winner("A")));
         assert!(res.is_err());
         // El hilo registra el error y sigue vivo.
-        let sender = spawn_stats_writer(conn, 60);
+        let sender = spawn_stats_writer(conn, 60, 1_000);
         sender.send(Stat::Winner("A")).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         sender.send(Stat::Winner("B")).unwrap();
@@ -1320,7 +1343,7 @@ mod tests {
         )
         .unwrap();
 
-        purge_stats(&conn, 60).unwrap();
+        purge_stats(&conn, 60, 1_000).unwrap();
 
         assert_eq!(count(&conn, "fastest_servers"), 1);
         assert_eq!(count(&conn, "blocked_requests"), 1);
@@ -1341,7 +1364,7 @@ mod tests {
             (),
         )
         .unwrap();
-        let _sender = spawn_stats_writer(conn, 60);
+        let _sender = spawn_stats_writer(conn, 60, 1_000);
         wait_count(&path, "blocked_requests", 0);
     }
 
@@ -1801,5 +1824,48 @@ mod tests {
             start(memory_db(), leak_servers(vec![("Cname", clean)])).await;
         let res = ask(addr, "www.shop.com.", RecordType::A).await.unwrap();
         assert!(matches!(res.answers[0].data, RData::CNAME(_)));
+    }
+
+    #[test]
+    fn purge_stats_keeps_only_the_newest_rows() {
+        let conn = memory_db();
+        for i in 0..10 {
+            conn.execute(
+                "INSERT INTO blocked_requests (domain) VALUES (?1)",
+                params![format!("d{i}.com")],
+            )
+            .unwrap();
+        }
+        purge_stats(&conn, 60, 3).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT domain FROM blocked_requests ORDER BY id")
+            .unwrap();
+        let kept: Vec<String> = stmt
+            .query_map((), |r| r.get(0))
+            .unwrap()
+            .map(|d| d.unwrap())
+            .collect();
+        assert_eq!(kept, ["d7.com", "d8.com", "d9.com"]);
+    }
+
+    #[test]
+    fn stats_writer_purges_when_rows_pile_up() {
+        let path = temp_path("rows.db");
+        let sender =
+            spawn_stats_writer(setup_database(&path).unwrap(), 60, 10);
+        for i in 0..30 {
+            sender.send(Stat::Blocked(format!("d{i}.com"))).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        sender.send(Stat::Blocked("last.com".into())).unwrap();
+        for _ in 0..100 {
+            let conn = Connection::open(&path).unwrap();
+            let rows = count(&conn, "blocked_requests");
+            if rows <= 11 && rows > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("stats table was never trimmed");
     }
 }
