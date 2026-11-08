@@ -75,10 +75,6 @@ struct Args {
     #[arg(long, value_name = "QUERIES", default_value_t = 256)]
     max_upstream_queries: usize,
 
-    /// Maximum number of cached responses.
-    #[arg(long, value_name = "ENTRIES", default_value_t = 10_000)]
-    cache_size: usize,
-
     /// Maximum memory used by cached responses, in megabytes.
     #[arg(long, value_name = "MB", default_value_t = 32)]
     cache_max_mb: usize,
@@ -127,8 +123,12 @@ struct Cache {
     bytes: usize,
 }
 
+// ponytail: flat estimate of the map, key and allocation overhead per entry,
+// so many tiny entries cannot exceed the byte budget by much
+const ENTRY_OVERHEAD: usize = 128;
+
 fn entry_size(key: &CacheKey, bytes: &[u8]) -> usize {
-    key.0.len() + bytes.len()
+    key.0.len() + bytes.len() + ENTRY_OVERHEAD
 }
 
 const DOH_SERVERS: Servers = &[
@@ -162,7 +162,6 @@ struct Resolver {
     blocklist: HashSet<Box<str>>,
     cache: Mutex<Cache>,
     stats: SyncSender<Stat>,
-    cache_size: usize,
     cache_max_bytes: usize,
     max_ttl: u32,
     blocked_ttl: u32,
@@ -503,7 +502,6 @@ impl Resolver {
                 args.stats_retention,
                 args.stats_max_rows,
             ),
-            cache_size: args.cache_size,
             cache_max_bytes: args.cache_max_mb.saturating_mul(1024 * 1024),
             max_ttl: args.max_ttl,
             blocked_ttl: args.blocked_ttl,
@@ -592,10 +590,7 @@ impl Resolver {
         if let Some((old, _)) = cache.entries.remove(&key) {
             cache.bytes -= entry_size(&key, &old);
         }
-        let full = |c: &Cache| {
-            c.entries.len() >= self.cache_size
-                || c.bytes + size > self.cache_max_bytes
-        };
+        let full = |c: &Cache| c.bytes + size > self.cache_max_bytes;
         if full(&cache) {
             let Cache { entries, bytes } = &mut *cache;
             entries.retain(|k, (b, expires)| {
@@ -901,7 +896,6 @@ mod tests {
             config: None,
             servers: vec![],
             upstream_timeout: 5,
-            cache_size: 10_000,
             cache_max_mb: 32,
             max_ttl: 86_400,
             blocked_ttl: 60,
@@ -1214,16 +1208,17 @@ mod tests {
     #[test]
     fn cache_evicts_when_full() {
         let mut resolver = resolver(memory_db(), DOH_SERVERS);
-        resolver.cache_size = 100;
         let msg = a_response(300);
+        resolver.cache_max_bytes =
+            entry_size(&key("d00.com"), &msg.to_vec().unwrap()) * 100;
         for i in 0..100 {
-            resolver.store(key(&format!("d{i}.com")), &msg);
+            resolver.store(key(&format!("d{i:02}.com")), &msg);
         }
         assert_eq!(resolver.cache.lock().unwrap().entries.len(), 100);
-        resolver.store(key("one-more.com"), &msg);
+        resolver.store(key("new.com"), &msg);
         let cache = resolver.cache.lock().unwrap();
         assert_eq!(cache.entries.len(), 100);
-        assert!(cache.entries.contains_key(&key("one-more.com")));
+        assert!(cache.entries.contains_key(&key("new.com")));
     }
 
     #[test]
@@ -1477,7 +1472,7 @@ mod tests {
             "config.toml",
             r#"
             listen = "0.0.0.0:5300"
-            cache_size = 500
+            cache_max_mb = 500
             verbose = true
             clear = false
             servers = ["quad9", "mine=https://doh.example.com/dns-query"]
@@ -1494,7 +1489,7 @@ mod tests {
         let args = with_config(Args::parse_from(&cli), &cli).unwrap();
 
         assert_eq!(args.listen, "127.0.0.1:5301".parse().unwrap());
-        assert_eq!(args.cache_size, 500);
+        assert_eq!(args.cache_max_mb, 500);
         assert!(args.verbose);
         assert!(!args.clear);
         assert_eq!(args.servers, [("Google", "https://8.8.8.8/dns-query")]);
@@ -1520,7 +1515,7 @@ mod tests {
             ("unknown.toml", "nope = 1"),
             ("table.toml", "[section]\nkey = 1"),
             ("array.toml", "servers = [1, 2]"),
-            ("type.toml", "cache_size = \"many\""),
+            ("type.toml", "cache_max_mb = \"many\""),
             ("syntax.toml", "listen ="),
         ] {
             let path = write_config(name, content);

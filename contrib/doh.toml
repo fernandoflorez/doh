@@ -1,4 +1,4 @@
-# Each key is a command line flag (cache_size and cache-size both work).
+# Each key is a command line flag (cache_max_mb and cache-max-mb both work).
 # Flags given on the command line take precedence over this file.
 
 # db_path = "doh_blocklist.db"
@@ -11,7 +11,6 @@
 
 # upstream_timeout = 5          # seconds
 # max_upstream_queries = 256    # cache misses in flight
-# cache_size = 10000            # entries
 # cache_max_mb = 32             # megabytes
 # max_ttl = 86400               # seconds
 # blocked_ttl = 60              # seconds

@@ -56,7 +56,7 @@ Resource limits, all configurable:
 |---|---|---|
 | `--max-tcp-connections` | 256 | Simultaneous TCP clients |
 | `--max-upstream-queries` | 256 | Cache misses waiting on DoH servers |
-| `--cache-size` / `--cache-max-mb` | 10,000 / 32 MB | Cached answers, by count and by memory |
+| `--cache-max-mb` | 32 MB | Memory used by cached answers |
 | `--max-ttl` | 86,400 s | How long an answer stays cached |
 | `--stats-max-rows` | 1,000,000 | Rows kept per statistics table |
 
@@ -84,12 +84,12 @@ Domains are stored in SQLite, in `doh_blocklist.db` by default (change it with `
 
 ## Configuration
 
-Every option can be set in a TOML file, using the flag name as the key (`cache_size` or `cache-size`). Command line flags take precedence over the file. See `contrib/doh.toml` for a commented example.
+Every option can be set in a TOML file, using the flag name as the key (`cache_max_mb` or `cache-max-mb`). Command line flags take precedence over the file. See `contrib/doh.toml` for a commented example.
 
 ```toml
 listen = "192.168.1.10:53"
 servers = ["cloudflare", "quad9"]
-cache_size = 20000
+cache_max_mb = 64
 stats_retention = 30
 ```
 
