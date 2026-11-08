@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser};
 use futures::future::select_ok;
-use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use reqwest::Client;
@@ -200,8 +200,10 @@ async fn doh_req(
     domain: &str,
     record_type: RecordType,
 ) -> Result<(Message, &'static str), BoxError> {
+    let mut qname = Name::from_ascii(domain)?;
+    qname.set_fqdn(true);
     let mut msg = Message::query();
-    msg.add_query(Query::query(Name::from_ascii(domain)?, record_type));
+    msg.add_query(Query::query(qname.clone(), record_type));
     msg.metadata.recursion_desired = true;
 
     let mut response = client
@@ -222,7 +224,15 @@ async fn doh_req(
         body.extend_from_slice(&chunk);
     }
 
-    Ok((Message::from_bytes(&body)?, name))
+    let res = Message::from_bytes(&body)?;
+    let answers_query = matches!(
+        res.queries.as_slice(),
+        [q] if q.name() == &qname && q.query_type() == record_type
+    );
+    if res.message_type != MessageType::Response || !answers_query {
+        return Err("upstream response does not match the query".into());
+    }
+    Ok((res, name))
 }
 
 async fn doh_race(
@@ -705,7 +715,6 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::MessageType;
     use std::io::Cursor;
     use std::sync::atomic::AtomicUsize;
 
@@ -1505,5 +1514,47 @@ mod tests {
             .await;
             assert!(res.is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn race_rejects_responses_that_do_not_answer_the_query() {
+        let reply = |qr: MessageType, name: &str, qtype: RecordType| {
+            let mut msg = Message::new(1, qr, OpCode::Query);
+            msg.add_query(Query::query(
+                Name::from_ascii(name).unwrap(),
+                qtype,
+            ));
+            msg.add_answer(Record::from_rdata(
+                Name::from_ascii(name).unwrap(),
+                60,
+                RData::A(Ipv4Addr::new(6, 6, 6, 6).into()),
+            ));
+            http_response("200 OK", "", &msg.to_vec().unwrap())
+        };
+        let cases = [
+            reply(MessageType::Query, "example.com.", RecordType::A),
+            reply(MessageType::Response, "other.com.", RecordType::A),
+            reply(MessageType::Response, "example.com.", RecordType::AAAA),
+        ];
+        for response in cases {
+            let servers =
+                leak_servers(vec![("Bad", mock_raw(response).await)]);
+            let res = doh_race(
+                &Client::new(),
+                servers,
+                "example.com",
+                RecordType::A,
+            )
+            .await;
+            assert!(res.is_err());
+        }
+
+        let ok = reply(MessageType::Response, "EXAMPLE.com.", RecordType::A);
+        let servers = leak_servers(vec![("Good", mock_raw(ok).await)]);
+        assert!(
+            doh_race(&Client::new(), servers, "example.com", RecordType::A)
+                .await
+                .is_ok()
+        );
     }
 }
