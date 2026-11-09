@@ -132,7 +132,7 @@ sudo cp contrib/doh.service /etc/systemd/system/
 sudo systemctl enable --now doh
 ```
 
-macOS (starts as root only to open port 53, then runs as `nobody` thanks to `--user`; the database lives in `/var/db/doh` and errors go to `/var/log/doh.log`, both root-owned locations):
+macOS (starts as root only to open port 53, then runs as `nobody` thanks to `--user`; the database lives in `/var/db/doh`, owned by `nobody` with mode 700, and errors go to the root-owned `/var/log/doh.log`):
 
 ```sh
 sudo install -d -o nobody -m 700 /var/db/doh
@@ -140,7 +140,7 @@ sudo cp contrib/local.doh.plist /Library/LaunchDaemons/
 sudo launchctl bootstrap system /Library/LaunchDaemons/local.doh.plist
 ```
 
-The blocklist is loaded when the service starts. To import a new list into the service database and restart it:
+The blocklist is loaded when the service starts. Start the service once before the first import, so the database is created by the service user. To import a new list into the service database and restart it:
 
 ```sh
 # Linux (systemd keeps DynamicUser state under /var/lib/private)
@@ -200,6 +200,8 @@ This project was developed with the help of two open source agent skills:
 ## Notes
 
 This does not prevent DNS leaks.
+
+doh does not validate DNSSEC itself; it relies on the upstream DoH resolvers, which do.
 
 
 ## License
