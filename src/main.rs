@@ -490,6 +490,7 @@ fn print_stats(conn: &Connection) -> Result<()> {
     while let Some(row) = rows.next()? {
         let (name, wins, pct): (String, i64, f64) =
             (row.get(0)?, row.get(1)?, row.get(2)?);
+        let name = name.escape_debug().to_string();
         println!("  {name:<12} {wins:>8} {pct:>6.1}%");
     }
 
@@ -501,6 +502,7 @@ fn print_stats(conn: &Connection) -> Result<()> {
     let mut rows = stmt.query(())?;
     while let Some(row) = rows.next()? {
         let (domain, blocks): (String, i64) = (row.get(0)?, row.get(1)?);
+        let domain = domain.escape_debug().to_string();
         println!("  {domain:<40} {blocks:>8}");
     }
     Ok(())
@@ -868,6 +870,7 @@ fn maintain(args: &Args, conn: &mut Connection) -> Result<(), BoxError> {
         conn.execute("DELETE FROM blocklist", ())?;
         println!("Blocklist cleared.");
     } else if args.stats {
+        purge_stats(conn, args.stats_retention, args.stats_max_rows)?;
         print_stats(conn)?;
     } else if let Some(path) = &args.blocklist {
         println!("Loading blocklist from: {:?}", path);
@@ -1510,14 +1513,19 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO fastest_servers (server_name)
                 VALUES ('Cloudflare'), ('Cloudflare'), ('Google');
-            INSERT INTO blocked_requests (domain) VALUES ('ads.example.com');",
+            INSERT INTO blocked_requests (domain) VALUES ('ads.example.com');
+            INSERT INTO blocked_requests (domain, timestamp)
+                VALUES ('expired.example.com', 0);",
         )
         .unwrap();
         drop(conn);
 
-        let mut args = args(db_path);
+        let mut args = args(db_path.clone());
         args.stats = true;
         maintain_db(&args).unwrap();
+        // Rows past the retention period are purged before printing.
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(count(&conn, "blocked_requests"), 1);
     }
 
     fn argv(args: &[&str]) -> Vec<OsString> {
