@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use futures::future::select_ok;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use reqwest::Client;
 use rusqlite::{Connection, Result, params};
@@ -704,7 +704,14 @@ impl Resolver {
             vlog!("Ignored a message that is not a standard query");
             return None;
         }
-        let query = request.queries.first()?;
+        let [query] = request.queries.as_slice() else {
+            vlog!("Ignored a query without exactly one question");
+            return None;
+        };
+        if query.query_class() != DNSClass::IN {
+            vlog!("Ignored a query of class {:?}", query.query_class());
+            return None;
+        }
         let qtype = query.query_type();
         let Some(domain) = query_domain(query.name()) else {
             vlog!("Rejected query with unsupported characters in its name");
@@ -2022,7 +2029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_and_non_query_opcodes_get_no_reply() {
+    async fn non_standard_queries_get_no_reply() {
         let resolver =
             resolver(blocked_db(Path::new(":memory:")), DOH_SERVERS);
         let query = Message::from_bytes(&query_bytes(
@@ -2041,6 +2048,15 @@ mod tests {
         let mut notify = query.clone();
         notify.metadata.op_code = OpCode::Notify;
         assert!(resolver.resolve(&notify, LOCAL).await.is_none());
+
+        // CH/HS questions used to get IN data echoed under their class.
+        let mut chaos = query.clone();
+        chaos.queries[0].set_query_class(DNSClass::CH);
+        assert!(resolver.resolve(&chaos, LOCAL).await.is_none());
+
+        let mut two = query.clone();
+        two.add_query(query.queries[0].clone());
+        assert!(resolver.resolve(&two, LOCAL).await.is_none());
 
         let addr = start(blocked_db(Path::new(":memory:")), DOH_SERVERS).await;
         assert!(send_raw(addr, &response.to_vec().unwrap()).await.is_none());
