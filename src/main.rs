@@ -889,6 +889,12 @@ fn drop_privileges(user: &str) -> Result<(), BoxError> {
         return Err(format!("unknown user {user}").into());
     }
     let (uid, gid) = unsafe { ((*entry).pw_uid, (*entry).pw_gid) };
+    if uid == 0 {
+        return Err(format!(
+            "--user {user} has uid 0; use an unprivileged account"
+        )
+        .into());
+    }
     let failed = unsafe {
         libc::setgroups(0, std::ptr::null()) != 0
             || libc::setgid(gid) != 0
@@ -901,7 +907,7 @@ fn drop_privileges(user: &str) -> Result<(), BoxError> {
         )
         .into());
     }
-    if uid != 0 && unsafe { libc::setuid(0) } == 0 {
+    if unsafe { libc::setuid(0) } == 0 {
         return Err("privileges could be regained after switching user".into());
     }
     Ok(())
@@ -2001,6 +2007,17 @@ mod tests {
         ]))
         .await;
         assert!(res.unwrap_err().to_string().contains("unknown user"));
+        assert!(!db.exists());
+
+        let res = run(argv(&[
+            "-d",
+            db.to_str().unwrap(),
+            "--stats",
+            "--user",
+            "root",
+        ]))
+        .await;
+        assert!(res.unwrap_err().to_string().contains("uid 0"));
         assert!(!db.exists());
     }
 
