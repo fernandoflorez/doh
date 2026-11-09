@@ -63,15 +63,15 @@ Resource limits, all configurable:
 
 If doh sits behind a router or another DNS forwarder, every query arrives from that one IP, so raise `--max-upstream-per-client` (for example to the `--max-upstream-queries` value).
 
-Run `cargo run -- --help` to see every option.
+Run `cargo run -- --help` to see every option. Without a command doh serves DNS; `import`, `clear` and `stats` manage the database and exit (`cargo run -- stats --help` shows their options).
 
 
 ## Blocklists
 
-Download a blocklist in hosts, plain domain or basic Adblock (`||domain^`) format, for example https://v.firebog.net/hosts/AdguardDNS.txt, and import it:
+Download a blocklist in hosts, plain domain or basic Adblock (`||domain^`) format, for example https://v.firebog.net/hosts/AdguardDNS.txt, and import it (several files can be given at once):
 
 ```sh
-cargo run -- --blocklist AdguardDNS.txt
+cargo run -- import AdguardDNS.txt
 ```
 
 The import exits when it finishes; start the server afterwards. A running server loads the blocklist at startup, so restart it to pick up a new import.
@@ -79,7 +79,7 @@ The import exits when it finishes; start the server afterwards. A running server
 To remove every blocked domain:
 
 ```sh
-cargo run -- --clear
+cargo run -- clear
 ```
 
 Domains are stored in SQLite, in `doh_blocklist.db` by default (change it with `--db-path`).
@@ -106,8 +106,10 @@ cargo run -- --config doh.toml
 The winning provider of each race and every blocked domain are recorded. To print a summary:
 
 ```sh
-cargo run -- --stats
+cargo run -- stats
 ```
+
+For scripts and dashboards, `cargo run -- stats --format json` prints the same summary as one JSON object.
 
 Entries older than 60 days are deleted automatically. To change the retention period:
 
@@ -144,11 +146,11 @@ The blocklist is loaded when the service starts. Start the service once before t
 
 ```sh
 # Linux (systemd keeps DynamicUser state under /var/lib/private)
-sudo doh --db-path /var/lib/private/doh/doh_blocklist.db --blocklist list.txt
+sudo doh --db-path /var/lib/private/doh/doh_blocklist.db import list.txt
 sudo systemctl restart doh
 
 # macOS
-sudo doh --db-path /var/db/doh/doh_blocklist.db --user nobody --blocklist list.txt
+sudo doh --db-path /var/db/doh/doh_blocklist.db --user nobody import list.txt
 sudo launchctl kickstart -k system/local.doh
 ```
 

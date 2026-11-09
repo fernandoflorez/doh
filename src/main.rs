@@ -1,4 +1,4 @@
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use futures::future::select_ok;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -29,22 +29,17 @@ use tokio::time::{sleep, timeout};
     args_override_self = true
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// TOML file with any of these options (keys use the long flag name).
     /// Command line flags take precedence over the file.
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(short, long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
     /// Path to the SQLite database file for the blocklist and statistics.
-    #[arg(short, long, default_value = "doh_blocklist.db")]
+    #[arg(short, long, default_value = "doh_blocklist.db", global = true)]
     db_path: PathBuf,
-
-    /// Import a blocklist from a local file and exit.
-    #[arg(short, long, value_name = "FILE")]
-    blocklist: Option<PathBuf>,
-
-    /// Clear all domains from the blocklist database.
-    #[arg(long)]
-    clear: bool,
 
     /// Address and port to listen on for DNS queries (UDP and TCP).
     #[arg(short, long, default_value = "127.0.0.1:53")]
@@ -52,7 +47,7 @@ struct Args {
 
     /// Switch to this user after opening the listening sockets, before
     /// touching the database (requires starting as root).
-    #[arg(short, long, value_name = "USER")]
+    #[arg(short, long, value_name = "USER", global = true)]
     user: Option<String>,
 
     /// DoH servers to race, comma separated: google, cloudflare, quad9,
@@ -101,21 +96,46 @@ struct Args {
     #[arg(long, value_name = "CONNECTIONS", default_value_t = 256)]
     max_tcp_connections: usize,
 
-    /// Print the stored statistics and exit.
-    #[arg(long)]
-    stats: bool,
-
     /// Days of statistics to keep; older entries are deleted.
-    #[arg(long, value_name = "DAYS", default_value_t = 60)]
+    #[arg(long, value_name = "DAYS", default_value_t = 60, global = true)]
     stats_retention: u32,
 
     /// Maximum rows kept in each statistics table; the oldest are deleted.
-    #[arg(long, value_name = "ROWS", default_value_t = 1_000_000)]
+    #[arg(
+        long,
+        value_name = "ROWS",
+        default_value_t = 1_000_000,
+        global = true
+    )]
     stats_max_rows: u64,
 
     /// Log every query, cache hit, blocked domain and winning server.
     #[arg(short, long)]
     verbose: bool,
+}
+
+/// Without a command, doh serves DNS.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Import blocklist files into the database and exit.
+    Import {
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
+    /// Remove every domain from the blocklist and exit.
+    Clear,
+    /// Print the stored statistics and exit.
+    Stats {
+        /// Output format; json prints one object for scripts and dashboards.
+        #[arg(short, long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum Format {
+    Text,
+    Json,
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -480,30 +500,85 @@ fn spawn_stats_writer(
     sender
 }
 
-fn print_stats(conn: &Connection) -> Result<()> {
-    println!("Fastest servers:");
-    let mut stmt = conn.prepare(
-        "SELECT server_name, COUNT(*), COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ()
-        FROM fastest_servers GROUP BY server_name ORDER BY 2 DESC",
-    )?;
-    let mut rows = stmt.query(())?;
-    while let Some(row) = rows.next()? {
-        let (name, wins, pct): (String, i64, f64) =
-            (row.get(0)?, row.get(1)?, row.get(2)?);
-        let name = name.escape_debug().to_string();
-        println!("  {name:<12} {wins:>8} {pct:>6.1}%");
+fn json_str(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
     }
+    out.push('"');
+    out
+}
 
-    println!("Most blocked domains:");
-    let mut stmt = conn.prepare(
-        "SELECT domain, COUNT(*) FROM blocked_requests
-        GROUP BY domain ORDER BY 2 DESC LIMIT 10",
-    )?;
-    let mut rows = stmt.query(())?;
-    while let Some(row) = rows.next()? {
-        let (domain, blocks): (String, i64) = (row.get(0)?, row.get(1)?);
-        let domain = domain.escape_debug().to_string();
-        println!("  {domain:<40} {blocks:>8}");
+fn print_stats(
+    conn: &Connection,
+    format: Format,
+    out: &mut impl io::Write,
+) -> Result<(), BoxError> {
+    let servers = conn
+        .prepare(
+            "SELECT server_name, COUNT(*), COUNT(*) * 100.0 / SUM(COUNT(*)) OVER ()
+            FROM fastest_servers GROUP BY server_name ORDER BY 2 DESC",
+        )?
+        .query_map((), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let domains = conn
+        .prepare(
+            "SELECT domain, COUNT(*) FROM blocked_requests
+            GROUP BY domain ORDER BY 2 DESC LIMIT 10",
+        )?
+        .query_map((), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>>>()?;
+
+    match format {
+        Format::Text => {
+            writeln!(out, "Fastest servers:")?;
+            for (name, wins, pct) in &servers {
+                let name = name.escape_debug().to_string();
+                writeln!(out, "  {name:<12} {wins:>8} {pct:>6.1}%")?;
+            }
+            writeln!(out, "Most blocked domains:")?;
+            for (domain, blocks) in &domains {
+                let domain = domain.escape_debug().to_string();
+                writeln!(out, "  {domain:<40} {blocks:>8}")?;
+            }
+        }
+        Format::Json => {
+            let servers: Vec<_> = servers
+                .iter()
+                .map(|(name, wins, pct)| {
+                    format!(
+                        r#"{{"name":{},"wins":{wins},"percent":{pct:.1}}}"#,
+                        json_str(name)
+                    )
+                })
+                .collect();
+            let domains: Vec<_> = domains
+                .iter()
+                .map(|(domain, blocks)| {
+                    format!(
+                        r#"{{"domain":{},"blocked":{blocks}}}"#,
+                        json_str(domain)
+                    )
+                })
+                .collect();
+            writeln!(
+                out,
+                r#"{{"fastest_servers":[{}],"blocked_domains":[{}]}}"#,
+                servers.join(","),
+                domains.join(",")
+            )?;
+        }
     }
     Ok(())
 }
@@ -872,19 +947,29 @@ async fn serve(
     );
 }
 
-fn maintain(args: &Args, conn: &mut Connection) -> Result<(), BoxError> {
-    if args.clear {
-        conn.execute("DELETE FROM blocklist", ())?;
-        println!("Blocklist cleared.");
-    } else if args.stats {
-        purge_stats(conn, args.stats_retention, args.stats_max_rows)?;
-        print_stats(conn)?;
-    } else if let Some(path) = &args.blocklist {
-        println!("Loading blocklist from: {:?}", path);
-        load_blocklist_from_reader(
-            conn,
-            io::BufReader::new(File::open(path)?),
-        )?;
+fn maintain(
+    args: &Args,
+    command: &Command,
+    conn: &mut Connection,
+) -> Result<(), BoxError> {
+    match command {
+        Command::Clear => {
+            conn.execute("DELETE FROM blocklist", ())?;
+            println!("Blocklist cleared.");
+        }
+        Command::Stats { format } => {
+            purge_stats(conn, args.stats_retention, args.stats_max_rows)?;
+            print_stats(conn, *format, &mut io::stdout().lock())?;
+        }
+        Command::Import { files } => {
+            for path in files {
+                println!("Loading blocklist from: {:?}", path);
+                load_blocklist_from_reader(
+                    conn,
+                    io::BufReader::new(File::open(path)?),
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -923,8 +1008,7 @@ fn drop_privileges(user: &str) -> Result<(), BoxError> {
 async fn run(argv: Vec<OsString>) -> Result<(), BoxError> {
     let args = with_config(Args::parse_from(&argv), &argv)?;
     VERBOSE.store(args.verbose, Ordering::Relaxed);
-    let serving = !args.clear && !args.stats && args.blocklist.is_none();
-    let sockets = if serving {
+    let sockets = if args.command.is_none() {
         Some((
             UdpSocket::bind(args.listen).await?,
             TcpListener::bind(args.listen).await?,
@@ -937,7 +1021,9 @@ async fn run(argv: Vec<OsString>) -> Result<(), BoxError> {
     }
     let mut conn = setup_database(&args.db_path)?;
     let Some((socket, listener)) = sockets else {
-        return maintain(&args, &mut conn);
+        let command =
+            args.command.as_ref().expect("no sockets without a command");
+        return maintain(&args, command, &mut conn);
     };
     let resolver = Resolver::new(conn, &args)?;
     println!("DNS server listening on {}", args.listen);
@@ -979,8 +1065,8 @@ mod tests {
         path
     }
 
-    fn maintain_db(args: &Args) -> Result<(), BoxError> {
-        maintain(args, &mut setup_database(&args.db_path)?)
+    fn maintain_db(args: &Args, command: Command) -> Result<(), BoxError> {
+        maintain(args, &command, &mut setup_database(&args.db_path)?)
     }
 
     fn memory_db() -> Connection {
@@ -989,9 +1075,8 @@ mod tests {
 
     fn args(db_path: PathBuf) -> Args {
         Args {
+            command: None,
             db_path,
-            blocklist: None,
-            clear: false,
             listen: "127.0.0.1:0".parse().unwrap(),
             user: None,
             config: None,
@@ -1004,7 +1089,6 @@ mod tests {
             max_tcp_connections: 256,
             max_upstream_queries: 256,
             max_upstream_per_client: 32,
-            stats: false,
             stats_retention: 60,
             stats_max_rows: 1_000_000,
             verbose: false,
@@ -1214,25 +1298,23 @@ mod tests {
         let list_path = temp_path("list.txt");
         std::fs::write(&list_path, "a.example.com\nb.example.com\n").unwrap();
 
-        let mut args = args(db_path.clone());
-        args.blocklist = Some(list_path);
-        maintain_db(&args).unwrap();
+        let args = args(db_path.clone());
+        let files = vec![list_path];
+        maintain_db(&args, Command::Import { files }).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocklist"), 2);
         drop(conn);
 
-        args.blocklist = None;
-        args.clear = true;
-        maintain_db(&args).unwrap();
+        maintain_db(&args, Command::Clear).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocklist"), 0);
     }
 
     #[test]
     fn maintain_fails_on_missing_blocklist_file() {
-        let mut args = args(PathBuf::from(":memory:"));
-        args.blocklist = Some(temp_path("missing.txt"));
-        assert!(maintain_db(&args).is_err());
+        let args = args(PathBuf::from(":memory:"));
+        let files = vec![temp_path("missing.txt")];
+        assert!(maintain_db(&args, Command::Import { files }).is_err());
     }
 
     #[test]
@@ -1533,12 +1615,45 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let mut args = args(db_path.clone());
-        args.stats = true;
-        maintain_db(&args).unwrap();
+        let format = Format::Text;
+        maintain_db(&args(db_path.clone()), Command::Stats { format })
+            .unwrap();
         // Rows past the retention period are purged before printing.
         let conn = Connection::open(&db_path).unwrap();
         assert_eq!(count(&conn, "blocked_requests"), 1);
+
+        let mut out = Vec::new();
+        print_stats(&conn, Format::Json, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            r#"{"fastest_servers":[{"name":"Cloudflare","wins":2,"percent":66.7},{"name":"Google","wins":1,"percent":33.3}],"blocked_domains":[{"domain":"ads.example.com","blocked":1}]}"#
+                .to_owned()
+                + "\n"
+        );
+        assert_eq!(json_str("a\"b\\c\u{1b}é"), r#""a\"b\\c\u001bé""#);
+    }
+
+    #[test]
+    fn subcommands_take_global_options_on_either_side() {
+        let args =
+            Args::parse_from(argv(&["-d", "a.db", "stats", "-f", "json"]));
+        assert!(matches!(
+            args.command,
+            Some(Command::Stats {
+                format: Format::Json
+            })
+        ));
+        assert_eq!(args.db_path, Path::new("a.db"));
+        let args = Args::parse_from(argv(&["import", "x", "y", "-d", "b.db"]));
+        assert_eq!(args.db_path, Path::new("b.db"));
+        assert!(
+            matches!(args.command, Some(Command::Import { files }) if files.len() == 2)
+        );
+        assert!(Args::try_parse_from(argv(&["import"])).is_err());
+        assert!(
+            Args::try_parse_from(argv(&["stats", "--listen", "0.0.0.0:53"]))
+                .is_err()
+        );
     }
 
     fn argv(args: &[&str]) -> Vec<OsString> {
@@ -1581,7 +1696,6 @@ mod tests {
             listen = "0.0.0.0:5300"
             cache_max_mb = 500
             verbose = true
-            clear = false
             servers = ["quad9", "mine=https://doh.example.com/dns-query"]
             "#,
         );
@@ -1598,7 +1712,6 @@ mod tests {
         assert_eq!(args.listen, "127.0.0.1:5301".parse().unwrap());
         assert_eq!(args.cache_max_mb, 500);
         assert!(args.verbose);
-        assert!(!args.clear);
         assert_eq!(args.servers, [("Google", "https://8.8.8.8/dns-query")]);
         assert_eq!(args.blocked_ttl, 60);
     }
@@ -1646,7 +1759,7 @@ mod tests {
     async fn run_prints_stats_and_exits() {
         let db = temp_path("run-stats.db");
         assert!(
-            run(argv(&["-d", db.to_str().unwrap(), "--stats"]))
+            run(argv(&["-d", db.to_str().unwrap(), "stats"]))
                 .await
                 .is_ok()
         );
@@ -2008,7 +2121,7 @@ mod tests {
         let res = run(argv(&[
             "-d",
             db.to_str().unwrap(),
-            "--stats",
+            "stats",
             "--user",
             "doh-no-such-user",
         ]))
@@ -2019,7 +2132,7 @@ mod tests {
         let res = run(argv(&[
             "-d",
             db.to_str().unwrap(),
-            "--stats",
+            "stats",
             "--user",
             "root",
         ]))
