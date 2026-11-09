@@ -343,6 +343,36 @@ fn setup_database(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+const NOT_BLOCKABLE: &[&str] = &[
+    "localhost",
+    "localhost.localdomain",
+    "local",
+    "broadcasthost",
+    "ip6-localhost",
+    "ip6-loopback",
+    "0.0.0.0",
+];
+
+fn blocklist_entry(line: &str) -> Option<String> {
+    let line = line.split(['#', '!']).next()?.trim();
+    let token = match line.strip_prefix("||") {
+        Some(rule) => rule.strip_suffix('^')?,
+        None => line.split_whitespace().last()?,
+    };
+    let domain = token
+        .strip_prefix("*.")
+        .unwrap_or(token)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let valid = domain.split('.').all(|label| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    });
+    (valid && !NOT_BLOCKABLE.contains(&domain.as_str())).then_some(domain)
+}
+
 fn load_blocklist_from_reader<R: BufRead>(
     conn: &mut Connection,
     reader: R,
@@ -352,15 +382,12 @@ fn load_blocklist_from_reader<R: BufRead>(
         let mut stmt = transaction
             .prepare("INSERT OR IGNORE INTO blocklist (domain) VALUES (?1)")?;
         let mut count = 0;
-        for line in reader
-            .lines()
-            .map_while(io::Result::ok)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        {
-            if let Some(host) = line.split_whitespace().last()
-                && stmt.execute(params![host.to_ascii_lowercase()]).is_ok()
+        for line in reader.split(b'\n').map_while(io::Result::ok) {
+            if let Some(domain) =
+                blocklist_entry(&String::from_utf8_lossy(&line))
+                && let Ok(added) = stmt.execute(params![domain])
             {
-                count += 1;
+                count += added;
             }
         }
         println!("{} blocklisted domains loaded", count);
@@ -2029,6 +2056,41 @@ mod tests {
                 .resolve(&request("one.example.com."), a)
                 .await
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn blocklist_import_understands_common_list_formats() {
+        let mut conn = memory_db();
+        let mut input = b"! adblock comment\n# hosts comment\n\
+            0.0.0.0 ads.example.com # inline comment\n\
+            127.0.0.1 localhost\n\
+            0.0.0.0 0.0.0.0\n\
+            ::1 ip6-localhost\n\
+            Trailing.Example.\n\
+            *.wild.example\n\
+            ||adblock.example^\n\
+            ||modified.example^$third-party\n\
+            @@||allowed.example^\n\
+            bad*name.example\n"
+            .to_vec();
+        input.extend_from_slice(
+            b"0.0.0.0 caf\xe9.example\nafter-invalid.example\nads.example.com\n",
+        );
+        load_blocklist_from_reader(&mut conn, Cursor::new(input)).unwrap();
+
+        let mut domains: Vec<_> =
+            load_blocklist(&conn).unwrap().into_iter().collect();
+        domains.sort();
+        assert_eq!(
+            domains,
+            [
+                "adblock.example".into(),
+                "ads.example.com".into(),
+                "after-invalid.example".into(),
+                "trailing.example".into(),
+                "wild.example".into(),
+            ]
         );
     }
 }

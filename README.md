@@ -68,7 +68,7 @@ Run `cargo run -- --help` to see every option.
 
 ## Blocklists
 
-Download a blocklist in hosts or plain domain format, for example https://v.firebog.net/hosts/AdguardDNS.txt, and import it:
+Download a blocklist in hosts, plain domain or basic Adblock (`||domain^`) format, for example https://v.firebog.net/hosts/AdguardDNS.txt, and import it:
 
 ```sh
 cargo run -- --blocklist AdguardDNS.txt
